@@ -2,7 +2,7 @@
 //! Phase 1: detect + run + lint/fmt/build/test/mix. (context stubbed; Phase 2.)
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::process;
 mod commands;
 mod detect;
@@ -39,7 +39,6 @@ Examples:
 #[command(
     name = "repo",
     version,
-    arg_required_else_help = true,
     after_long_help = EXAMPLES
 )]
 struct Cli {
@@ -105,11 +104,15 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let Some(command) = cli.command else {
+        // No subcommand: show help and succeed (help is not an error; avoids
+        // tripping shell error traps like zsh TRAPZERR / `set -e` chains).
+        Cli::command().print_help()?;
+        println!();
         return Ok(());
     };
 
     let cwd = std::env::current_dir().context("failed to read current directory")?;
-    let detector = Detector::new(cwd);
+    let detector = Detector::new(cwd)?;
     let globals = Globals {
         verbose: cli.verbose,
         full: cli.full,

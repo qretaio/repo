@@ -1,11 +1,16 @@
-//! Project detection module — detects project types and available commands
-//! based on file presence. Rust port of ts-src/detect.ts (behavioral parity).
+//! Project detection module — detects project types and available commands.
+//! Built-in detection is marker-file based; rich boolean detection (AND/OR,
+//! source-layout, marker-content) is configurable via CEL expressions in
+//! `repo.toml` (see [`CompiledRule`] / [`Detector::load_rules`]).
 
+use anyhow::Context as _;
+use cel_interpreter::{Context, Program, Value};
+use colored::Colorize;
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use colored::Colorize;
+use std::sync::Arc;
 
 /// Predicate over the detector. Pure (captures nothing) so it coerces to a fn pointer.
 pub type Pred = fn(&Detector) -> bool;
@@ -69,7 +74,9 @@ pub struct Commands {
 pub struct ProjectType {
     pub name: String,
     pub id: String,
-    pub detect_files: Vec<String>,
+    /// Built-in fallback: project is detected when ANY of these entries exist.
+    /// A `repo.toml` `[[detect]]` rule with the same `id` overrides this.
+    pub detect_files: &'static [&'static str],
     pub commands: Commands,
 }
 
@@ -104,10 +111,13 @@ pub struct Detector {
     node_pm: Option<&'static str>,
     #[allow(dead_code)] // Phase 2: detectProjectTypeFlags.packageManager
     python_pm: Option<&'static str>,
+    /// Compiled `repo.toml` `[[detect]]` rules. Override built-in detection by
+    /// `id`, or declare new detect-only project types. Empty when no config.
+    rules: Vec<CompiledRule>,
 }
 
 impl Detector {
-    pub fn new(cwd: PathBuf) -> Self {
+    pub fn new(cwd: PathBuf) -> anyhow::Result<Self> {
         let entries = scan_entries(&cwd);
         // Read file contents only when the file actually exists.
         let read = |rel: &str| -> Option<String> {
@@ -122,7 +132,23 @@ impl Detector {
         let requirements = read("requirements.txt");
         let node_pm = detect_package_manager(&entries);
         let python_pm = detect_python_package_manager(&entries, &pyproject);
-        Self {
+        let rules = load_rules(&cwd)?;
+        // Fail loud: every rule must compile (done in load_rules) AND evaluate
+        // to a bool against this snapshot, so a typo'd host function or a
+        // non-boolean expression is caught at startup, not mid-lint.
+        for rule in &rules {
+            let ctx = cel_context(&cwd, &entries);
+            match rule.program.execute(&ctx) {
+                Ok(Value::Bool(_)) => {}
+                Ok(v) => anyhow::bail!(
+                    "repo.toml detect[{}]: expression must evaluate to bool, got {:?}",
+                    rule.id,
+                    v
+                ),
+                Err(e) => anyhow::bail!("repo.toml detect[{}]: {}", rule.id, e),
+            }
+        }
+        Ok(Self {
             cwd,
             entries,
             pkg,
@@ -130,7 +156,8 @@ impl Detector {
             requirements,
             node_pm,
             python_pm,
-        }
+            rules,
+        })
     }
 
     /// O(1) membership check against the single up-front directory scan.
@@ -149,16 +176,7 @@ impl Detector {
     }
 
     fn has_files_with_ext(&self, dir: &str, ext: &str) -> bool {
-        let entries = match fs::read_dir(self.cwd.join(dir)) {
-            Ok(e) => e,
-            Err(_) => return false,
-        };
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().ends_with(ext) {
-                return true;
-            }
-        }
-        false
+        dir_has_ext(&self.cwd.join(dir), ext)
     }
 
     #[allow(dead_code)] // Phase 2: detectProjectTypeFlags (frameworks)
@@ -255,10 +273,38 @@ impl Detector {
     }
 
     pub fn detect_project_types(&self) -> Vec<ProjectType> {
-        self.all_project_types()
-            .into_iter()
-            .filter(|p| p.detect_files.iter().any(|f| self.exists(f)))
-            .collect()
+        let ctx = cel_context(&self.cwd, &self.entries);
+        let mut out: Vec<ProjectType> = Vec::new();
+        // Built-ins: a config rule with the same id overrides marker-file
+        // detection; otherwise fall back to detect_files.
+        for mut p in self.all_project_types() {
+            match self.rules.iter().find(|r| r.id == p.id) {
+                Some(rule) if rule.eval_bool(&ctx) => {
+                    if !rule.name.is_empty() {
+                        p.name = rule.name.clone();
+                    }
+                    out.push(p);
+                }
+                None if p.detect_files.iter().any(|f| self.exists(f)) => out.push(p),
+                _ => {}
+            }
+        }
+        // Config-only types (id not built-in): detected, but carry no commands
+        // until command tables are also configurable (future work).
+        for rule in &self.rules {
+            if self.all_project_types().iter().any(|p| p.id == rule.id) {
+                continue;
+            }
+            if rule.eval_bool(&ctx) {
+                out.push(ProjectType {
+                    name: rule.name.clone(),
+                    id: rule.id.clone(),
+                    detect_files: &[],
+                    commands: Commands::default(),
+                });
+            }
+        }
+        out
     }
 
     /// All five project types, unconditionally built (table source of truth).
@@ -277,7 +323,7 @@ impl Detector {
         ProjectType {
             name: "Node.js".into(),
             id: "nodejs".into(),
-            detect_files: vec!["package.json".into()],
+            detect_files: &["package.json"],
             commands: Commands {
                 lint: vec![
                     CommandDef::new("ESLint", &["npx", "eslint", "."])
@@ -320,11 +366,11 @@ impl Detector {
         ProjectType {
             name: "Python".into(),
             id: "python".into(),
-            detect_files: vec![
-                "pyproject.toml".into(),
-                "requirements.txt".into(),
-                ".python-version".into(),
-                "setup.py".into(),
+            detect_files: &[
+                "pyproject.toml",
+                "requirements.txt",
+                ".python-version",
+                "setup.py",
             ],
             commands: Commands {
                 lint: vec![
@@ -378,7 +424,7 @@ impl Detector {
         ProjectType {
             name: "Rust".into(),
             id: "rust".into(),
-            detect_files: vec!["Cargo.toml".into()],
+            detect_files: &["Cargo.toml"],
             commands: Commands {
                 lint: vec![
                     CommandDef::new(
@@ -406,7 +452,7 @@ impl Detector {
         ProjectType {
             name: "Go".into(),
             id: "go".into(),
-            detect_files: vec!["go.mod".into()],
+            detect_files: &["go.mod"],
             commands: Commands {
                 lint: vec![
                     CommandDef::new("Vet", &["go", "vet", "./..."]),
@@ -464,11 +510,11 @@ impl Detector {
         ProjectType {
             name: "Java/Kotlin".into(),
             id: "jvm".into(),
-            detect_files: vec![
-                "build.gradle".into(),
-                "build.gradle.kts".into(),
-                "pom.xml".into(),
-                "settings.gradle".into(),
+            detect_files: &[
+                "build.gradle",
+                "build.gradle.kts",
+                "pom.xml",
+                "settings.gradle",
             ],
             commands: Commands {
                 lint: vec![
@@ -728,4 +774,134 @@ fn python_dep_match(content: &str, dep: &str) -> bool {
         let t = line.trim_start();
         t.starts_with(dep) && t[dep.len()..].starts_with(['=', '<', '>', '~'])
     })
+}
+
+// ---- CEL config-driven detection ----
+
+/// A `repo.toml` `[[detect]]` rule with its CEL expression compiled once at
+/// load. Evaluation against a project snapshot is cheap and repeated.
+pub struct CompiledRule {
+    pub id: String,
+    pub name: String,
+    program: Program,
+}
+
+impl CompiledRule {
+    fn eval_bool(&self, ctx: &Context) -> bool {
+        matches!(self.program.execute(ctx), Ok(Value::Bool(true)))
+    }
+}
+
+#[derive(Deserialize)]
+struct DetectConfig {
+    #[serde(default)]
+    detect: Vec<DetectRaw>,
+}
+
+#[derive(Deserialize)]
+struct DetectRaw {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    expr: String,
+}
+
+/// Load and compile `repo.toml` `[[detect]]` rules. Returns empty when there is
+/// no `repo.toml`. Parse/compile errors fail loud with the offending rule id.
+fn load_rules(cwd: &Path) -> anyhow::Result<Vec<CompiledRule>> {
+    let path = cwd.join("repo.toml");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let cfg: DetectConfig =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    cfg.detect
+        .into_iter()
+        .map(|r| {
+            let program = Program::compile(&r.expr)
+                .map_err(|e| anyhow::anyhow!("repo.toml detect[{}]: {}", r.id, e))?;
+            Ok(CompiledRule {
+                name: r.name.unwrap_or_else(|| r.id.clone()),
+                id: r.id,
+                program,
+            })
+        })
+        .collect()
+}
+
+/// Build a CEL evaluation context over the project snapshot. Host functions:
+/// `file(name)` — entry exists at root; `has_ext(dir, ext)` — `dir` holds a file
+/// ending in `ext`; `contains(file, needle)` — `file` exists and contains
+/// `needle`. Closures capture owned `Arc` snapshots so the context is `'static`.
+fn cel_context(cwd: &Path, entries: &HashSet<String>) -> Context<'static> {
+    let files = Arc::new(entries.clone());
+    let root = Arc::new(cwd.to_path_buf());
+    let mut ctx = Context::default();
+    let f = files.clone();
+    ctx.add_function("file", move |name: Arc<String>| -> bool {
+        f.contains(name.as_str())
+    });
+    let (f2, root2) = (files.clone(), root.clone());
+    ctx.add_function(
+        "contains",
+        move |name: Arc<String>, needle: Arc<String>| -> bool {
+            f2.contains(name.as_str())
+                && fs::read_to_string(root2.join(name.as_str()))
+                    .is_ok_and(|c| c.contains(needle.as_str()))
+        },
+    );
+    let root3 = root.clone();
+    ctx.add_function(
+        "has_ext",
+        move |dir: Arc<String>, ext: Arc<String>| -> bool {
+            dir_has_ext(&root3.join(dir.as_str()), ext.as_str())
+        },
+    );
+    ctx
+}
+
+fn dir_has_ext(dir: &Path, ext: &str) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(ext))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cwd() -> PathBuf {
+        std::env::current_dir().unwrap()
+    }
+
+    #[test]
+    fn cel_host_functions() {
+        let dir = cwd();
+        let entries = scan_entries(&dir);
+        let ctx = cel_context(&dir, &entries);
+        let eval = |src: &str| -> bool {
+            matches!(
+                Program::compile(src).unwrap().execute(&ctx),
+                Ok(Value::Bool(true))
+            )
+        };
+        assert!(eval("file('Cargo.toml')"));
+        assert!(!eval("file('nope.xyz')"));
+        assert!(eval("file('Cargo.toml') && !file('package.json')"));
+        assert!(eval("file('Cargo.toml') || file('nope.xyz')"));
+        assert!(eval("has_ext('src', '.rs')"));
+        assert!(!eval("has_ext('src', '.py')"));
+        assert!(eval("contains('Cargo.toml', '[package]')"));
+        assert!(!eval("contains('Cargo.toml', 'zz-not-present')"));
+    }
+
+    #[test]
+    fn load_rules_without_config_is_empty() {
+        if cwd().join("repo.toml").exists() {
+            return; // a local config would change this; skip then
+        }
+        assert!(load_rules(&cwd()).unwrap().is_empty());
+    }
 }
