@@ -1,0 +1,8 @@
+# Rust
+/target
+
+# Misc
+*.log
+.DS_Store
+*.local
+.claude/
