@@ -78,6 +78,27 @@ pub struct ProjectType {
     pub name: String,
     detect: Arc<Program>,
     pub commands: Commands,
+    pub context: Option<ContextDef>,
+}
+
+/// Compiled per-language intelligence rules (from the YAML `context:` block).
+pub struct ContextDef {
+    stack: Option<String>,
+    runtime: Option<String>,
+    cli: Option<Arc<Program>>,
+    library: Option<Arc<Program>>,
+    gates: Vec<(String, Option<Arc<Program>>)>,
+    entries: Vec<(String, String, Option<Arc<Program>>)>,
+}
+
+/// One project's evaluated intelligence, ready to format.
+#[derive(Clone)]
+pub struct Intelligence {
+    pub stack: String,
+    pub runtime: String,
+    pub arch: String,
+    pub gates: Vec<String>,
+    pub entry: Option<(String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,11 +139,13 @@ impl Detector {
                 detected.insert(id.clone());
             }
             let commands = build_commands(p, pm)?;
+            let context = build_context(&p.context)?;
             projects.push(ProjectType {
                 name: p.name.clone().unwrap_or_else(|| id.clone()),
                 id: id.clone(),
                 detect,
                 commands,
+                context,
             });
         }
 
@@ -168,6 +191,16 @@ impl Detector {
         self.projects
             .iter()
             .filter(|p| eval_bool(&p.detect, &self.cel))
+            .collect()
+    }
+
+    /// Evaluate the `context:` intelligence block for every detected project
+    /// that declares one. Aggregation (stack join, gate union, …) is left to
+    /// the caller — this returns raw per-project results.
+    pub fn intelligence(&self) -> Vec<Intelligence> {
+        self.detect_project_types()
+            .iter()
+            .filter_map(|p| p.context.as_ref().map(|c| eval_intel(c, &self.cel)))
             .collect()
     }
 
@@ -321,6 +354,8 @@ struct ProjectRaw {
     dev: Vec<CommandRaw>,
     #[serde(default)]
     run: Vec<CommandRaw>,
+    #[serde(default)]
+    context: Option<ContextRaw>,
 }
 
 #[derive(Deserialize)]
@@ -335,6 +370,43 @@ struct CommandRaw {
     check: Option<String>,
     #[serde(default)]
     cost: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct ContextRaw {
+    #[serde(default)]
+    stack: Option<String>,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    arch: Option<ArchRaw>,
+    #[serde(default)]
+    gates: Vec<GateRaw>,
+    #[serde(default)]
+    entry_points: Vec<EntryRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct ArchRaw {
+    #[serde(default)]
+    cli: Option<String>,
+    #[serde(default)]
+    library: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GateRaw {
+    name: String,
+    #[serde(default)]
+    when: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EntryRaw {
+    path: String,
+    purpose: String,
+    #[serde(default)]
+    when: Option<String>,
 }
 
 fn load_config() -> anyhow::Result<RepoConfig> {
@@ -428,6 +500,56 @@ fn build_commands(p: &ProjectRaw, pm: &str) -> anyhow::Result<Commands> {
     })
 }
 
+/// Compile a project's `context:` intelligence block into runnable programs.
+fn build_context(raw: &Option<ContextRaw>) -> anyhow::Result<Option<ContextDef>> {
+    let Some(r) = raw.as_ref() else {
+        return Ok(None);
+    };
+    let (cli, library) = match &r.arch {
+        Some(a) => (
+            a.cli
+                .as_ref()
+                .map(|e| compile_cel(e, "context.arch.cli"))
+                .transpose()?
+                .map(Arc::new),
+            a.library
+                .as_ref()
+                .map(|e| compile_cel(e, "context.arch.library"))
+                .transpose()?
+                .map(Arc::new),
+        ),
+        None => (None, None),
+    };
+    let mut gates = Vec::with_capacity(r.gates.len());
+    for g in &r.gates {
+        let when = g
+            .when
+            .as_ref()
+            .map(|e| compile_cel(e, &format!("context.gates.{}", g.name)))
+            .transpose()?
+            .map(Arc::new);
+        gates.push((g.name.clone(), when));
+    }
+    let mut entries = Vec::with_capacity(r.entry_points.len());
+    for e in &r.entry_points {
+        let when = e
+            .when
+            .as_ref()
+            .map(|w| compile_cel(w, "context.entry_points"))
+            .transpose()?
+            .map(Arc::new);
+        entries.push((e.path.clone(), e.purpose.clone(), when));
+    }
+    Ok(Some(ContextDef {
+        stack: r.stack.clone(),
+        runtime: r.runtime.clone(),
+        cli,
+        library,
+        gates,
+        entries,
+    }))
+}
+
 fn build_cmds(raws: &[CommandRaw], pm: &str) -> anyhow::Result<Vec<CommandDef>> {
     raws.iter().map(|r| build_cmd(r, pm)).collect()
 }
@@ -465,6 +587,62 @@ fn eval_bool(prog: &Program, ctx: &Context) -> bool {
     matches!(prog.execute(ctx), Ok(Value::Bool(true)))
 }
 
+/// Evaluate one project's compiled intelligence block against the CEL context.
+fn eval_intel(ctx: &ContextDef, cel: &Context) -> Intelligence {
+    let stack = ctx
+        .stack
+        .as_ref()
+        .map(|s| cel_or_literal(s, cel))
+        .unwrap_or_default();
+    let runtime = ctx
+        .runtime
+        .as_ref()
+        .map(|r| cel_or_literal(r, cel))
+        .unwrap_or_default();
+    let arch = if ctx.cli.as_ref().is_some_and(|p| eval_bool(p, cel)) {
+        "CLI"
+    } else if ctx.library.as_ref().is_some_and(|p| eval_bool(p, cel)) {
+        "Library"
+    } else {
+        "CLI"
+    }
+    .to_string();
+    let gates = ctx
+        .gates
+        .iter()
+        .filter(|(_, w)| w.as_ref().is_none_or(|p| eval_bool(p, cel)))
+        .map(|(n, _)| n.clone())
+        .collect();
+    let entry = ctx.entries.iter().find_map(|(path, purpose, when)| {
+        let matched = match when {
+            Some(p) => eval_bool(p, cel),
+            None => Path::new(path).exists(),
+        };
+        matched.then(|| (path.clone(), purpose.clone()))
+    });
+    Intelligence {
+        stack,
+        runtime,
+        arch,
+        gates,
+        entry,
+    }
+}
+
+/// A `=`-prefixed string is a CEL expression returning a String; otherwise the
+/// string is a literal. Keeps `runtime: Rust` readable while allowing
+/// `runtime: '="Python " + read(".python-version")'`.
+fn cel_or_literal(raw: &str, cel: &Context) -> String {
+    if let Some(expr) = raw.strip_prefix('=') {
+        if let Ok(prog) = Program::compile(expr) {
+            if let Ok(Value::String(s)) = prog.execute(cel) {
+                return s.trim().to_string();
+            }
+        }
+    }
+    raw.to_string()
+}
+
 fn validate_bool(prog: &Program, ctx: &Context, label: &str) -> anyhow::Result<()> {
     match prog.execute(ctx) {
         Ok(Value::Bool(_)) => Ok(()),
@@ -500,6 +678,12 @@ fn cel_context(pkg: &Option<serde_json::Value>) -> Context<'static> {
             fs::read_to_string(name.as_str()).is_ok_and(|c| c.contains(needle.as_str()))
         },
     );
+
+    // read(file) — file contents (or empty string). For CEL value exprs
+    // like runtime: `="Python " + read(".python-version")`.
+    ctx.add_function("read", move |name: Arc<String>| -> String {
+        fs::read_to_string(name.as_str()).unwrap_or_default()
+    });
 
     // script(name) — package.json defines a script named `name`.
     ctx.add_function("script", move |name: Arc<String>| -> bool {

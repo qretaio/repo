@@ -26,6 +26,15 @@ projects:
   rust:
     name: Rust
     detect: "glob('Cargo.toml')"
+    context:
+      stack: RUST
+      runtime: Rust
+      arch:
+        cli: "contains('Cargo.toml', '[[bin]]') || glob('src/main.rs')"
+        library: "glob('src/lib.rs')"
+      entry_points:
+        - { path: src/main.rs, purpose: "Main entry point" }
+        - { path: src/lib.rs, purpose: "Library entry point" }
     lint:
       - name: Clippy
         cmd: cargo clippy --all-targets -- -D warnings
@@ -65,6 +74,15 @@ projects:
   go:
     name: Go
     detect: "glob('go.mod')"
+    context:
+      stack: GO
+      runtime: Go
+      arch:
+        cli: "glob('main.go') || glob('cmd')"
+        library: "!glob('main.go') && !glob('cmd')"
+      entry_points:
+        - { path: cmd/main.go, purpose: "CLI entry point" }
+        - { path: main.go, purpose: "Main entry point" }
     lint:
       - name: Vet
         cmd: go vet ./...
@@ -109,6 +127,19 @@ projects:
   nodejs:
     name: Node.js
     detect: "glob('package.json')"
+    context:
+      stack: '=glob("tsconfig.json") ? "TS" : "JS"'
+      runtime: Node.js
+      arch:
+        cli: "contains('package.json', '\"bin\"')"
+        library: "contains('package.json', '\"main\"')"
+      gates:
+        - { name: strict, when: "contains('tsconfig.json', '\"strict\": true')" }
+        - { name: vitest, when: "contains('package.json', 'vitest')" }
+        - { name: jest, when: "contains('package.json', '\"jest\"')" }
+      entry_points:
+        - { path: src/cli.ts, purpose: "CLI entry point" }
+        - { path: src/index.ts, purpose: "Main entry point" }
     lint:
       - name: ESLint
         cmd: npx eslint .
@@ -158,6 +189,17 @@ projects:
   python:
     name: Python
     detect: "glob('pyproject.toml') || glob('requirements.txt') || glob('.python-version') || glob('setup.py')"
+    context:
+      stack: PY
+      runtime: '="Python " + read(".python-version")'
+      arch:
+        cli: "glob('main.py') || glob('src/main.py') || glob('__main__.py')"
+        library: "glob('pyproject.toml')"
+      gates:
+        - { name: pytest, when: "contains('pyproject.toml', 'pytest')" }
+      entry_points:
+        - { path: main.py, purpose: "Main entry point" }
+        - { path: src/main.py, purpose: "Main entry point" }
     lint:
       - name: Ruff
         cmd: uv run ruff check .
@@ -207,6 +249,9 @@ projects:
   jvm:
     name: Java/Kotlin
     detect: "glob('build.gradle*') || glob('pom.xml') || glob('settings.gradle')"
+    context:
+      stack: JAVA
+      runtime: Java/JVM
     lint:
       - name: Checkstyle
         cmd: ./gradlew checkstyleMain

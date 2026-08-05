@@ -251,168 +251,46 @@ fn format_git(git: &GitContext) -> String {
     lines.join("\n")
 }
 
-fn py_runtime(base: &Path) -> Option<String> {
-    if let Some(v) = read_rel(base, ".python-version") {
-        return Some(format!("Python {}", v.trim()));
+fn gather_intelligence(detector: &Detector) -> String {
+    let intels = detector.intelligence();
+    let mut out = vec!["## Intelligence".to_string()];
+    if intels.is_empty() {
+        return out.join("\n");
     }
-    if let Some(p) = read_rel(base, "pyproject.toml") {
-        if let Some(caps) = Regex::new(r#"python\s*=\s*["']([^"']+)["']"#)
-            .ok()?
-            .captures(&p)
-        {
-            return Some(format!("Python {}", &caps[1]));
-        }
-    }
-    Some("Python".to_string())
-}
 
-fn node_runtime(base: &Path) -> Option<String> {
-    read_json(base, "package.json")
-        .and_then(|p| p.get("engines").and_then(|e| e.get("node")).cloned())
-        .map(|n| format!("Node.js {}", n.as_str().unwrap_or("?")))
-        .or(Some("Node.js".to_string()))
-}
-
-fn detect_arch(base: &Path, flags: Flags) -> String {
-    let mut arch: Vec<&str> = vec![];
-    let entries = [
-        "src/cli.ts",
-        "src/main.rs",
-        "cmd/main.go",
-        "main.py",
-        "src/main.py",
-    ];
-    for e in entries {
-        if base.join(e).exists() {
-            arch.push("CLI");
-            break;
-        }
-    }
-    if base.join("package.json").exists() && !base.join("src/main.rs").exists() {
-        if let Some(p) = read_json(base, "package.json") {
-            if p.get("bin").is_some() {
-                arch.push("CLI");
-            } else if p.get("main").is_some() {
-                arch.push("Library");
-            }
-        }
-    }
-    if arch.is_empty() {
-        arch.push("CLI");
-    }
-    let _ = flags;
-    arch.first().copied().unwrap_or("CLI").to_string()
-}
-
-fn detect_gates(base: &Path, flags: Flags) -> Vec<String> {
-    let mut gates = vec![];
-    if flags.typescript {
-        if let Some(ts) = read_json(base, "tsconfig.json") {
-            if ts
-                .get("compilerOptions")
-                .and_then(|o| o.get("strict"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                gates.push("strict".to_string());
-            }
-        }
-    }
-    let prettier_files = ["prettier.config.js", ".prettierrc", ".prettierrc.json"];
-    for f in prettier_files {
-        if let Some(c) = read_rel(base, f) {
-            if c.contains("singleQuote: true") {
-                gates.push("'".to_string());
-            }
-            if c.contains("semi: true") {
-                gates.push("semi".to_string());
-            }
-            break;
-        }
-    }
-    if let Some(p) = read_json(base, "package.json") {
-        let has = |dep: &str| -> bool {
-            ["dependencies", "devDependencies"]
-                .iter()
-                .any(|k| p.get(*k).and_then(|d| d.get(dep)).is_some())
-        };
-        if has("vitest") {
-            gates.push("vitest".to_string());
-        } else if has("jest") {
-            gates.push("jest".to_string());
-        }
-    }
-    if flags.python {
-        if let Some(p) = read_rel(base, "pyproject.toml") {
-            if p.contains("pytest") {
-                gates.push("pytest".to_string());
-            }
-        }
-    }
-    gates
-}
-
-fn entry_point(base: &Path) -> Option<(&'static str, &'static str)> {
-    let candidates = [
-        ("src/cli.ts", "CLI entry point"),
-        ("src/index.ts", "Main entry point"),
-        ("src/main.rs", "Main entry point"),
-        ("src/lib.rs", "Library entry point"),
-        ("cmd/main.go", "CLI entry point"),
-        ("main.py", "Main entry point"),
-        ("src/main.py", "Main entry point"),
-    ];
-    candidates
+    // Aggregate across detected projects: join stacks, take first runtime/arch,
+    // union gates (order-preserving), take first entry point.
+    let stack = intels
         .iter()
-        .find(|(p, _)| base.join(p).exists())
-        .copied()
-}
-
-fn gather_intelligence(base: &Path, flags: Flags) -> String {
-    let mut stack: Vec<&str> = vec![];
-    if flags.typescript {
-        stack.push("TS");
-    } else if flags.node {
-        stack.push("JS");
-    }
-    if flags.python {
-        stack.push("PY");
-    }
-    if flags.rust {
-        stack.push("RUST");
-    }
-    if flags.go {
-        stack.push("GO");
-    }
-    if flags.java {
-        stack.push("JAVA");
+        .map(|i| i.stack.as_str())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("|");
+    let runtime = intels
+        .iter()
+        .find_map(|i| (!i.runtime.is_empty()).then(|| i.runtime.clone()))
+        .unwrap_or_default();
+    let arch = intels.first().map(|i| i.arch.as_str()).unwrap_or("CLI");
+    let mut gates: Vec<String> = vec![];
+    for i in &intels {
+        for g in &i.gates {
+            if !gates.contains(g) {
+                gates.push(g.clone());
+            }
+        }
     }
 
-    let runtime = if flags.rust {
-        Some("Rust".to_string())
-    } else if flags.go {
-        Some("Go".to_string())
-    } else if flags.python {
-        py_runtime(base)
-    } else if flags.node {
-        node_runtime(base)
-    } else {
-        None
-    };
-    let arch = detect_arch(base, flags);
-    let gates = detect_gates(base, flags);
-
-    let mut line = stack.join("|");
+    let mut line = stack;
     line.push_str(&format!("→{}", arch));
-    if let Some(r) = runtime {
-        line.push_str(&format!("|{}", r));
+    if !runtime.is_empty() {
+        line.push_str(&format!("|{}", runtime));
     }
     if !gates.is_empty() {
         line.push_str(&format!(" {}", gates.join(":")));
     }
+    out.push(line);
 
-    let mut out = vec!["## Intelligence".to_string(), line];
-    if let Some((path, purpose)) = entry_point(base) {
+    if let Some((path, purpose)) = intels.iter().find_map(|i| i.entry.clone()) {
         out.push(format!(
             "{}: {}",
             path,
@@ -1414,10 +1292,13 @@ pub fn gather(detector: &Detector, base: &Path, opts: &ContextOptions) -> anyhow
     let flags = Flags::from(detector, base);
     check_dependencies(opts)?;
 
-    let (git, intel, metadata, rules, readme, stats, analysis, audit, graph, tests, todos, listing) =
+    // Intelligence is config-driven (needs the Detector, not threads); compute
+    // it up front so the parallel gatherers only touch `base` / `flags`.
+    let intel = gather_intelligence(detector);
+
+    let (git, metadata, rules, readme, stats, analysis, audit, graph, tests, todos, listing) =
         std::thread::scope(|s| {
             let h_git = s.spawn(|| gather_git(base));
-            let h_intel = s.spawn(|| gather_intelligence(base, flags));
             let h_meta = if opts.metadata {
                 Some(s.spawn(|| gather_metadata(base, flags)))
             } else {
@@ -1451,7 +1332,6 @@ pub fn gather(detector: &Detector, base: &Path, opts: &ContextOptions) -> anyhow
 
             (
                 h_git.join().ok().flatten(),
-                h_intel.join().unwrap_or_default(),
                 h_meta.and_then(|h| h.join().ok()).unwrap_or_default(),
                 h_rules.and_then(|h| h.join().ok()).unwrap_or_default(),
                 h_readme.and_then(|h| h.join().ok()).flatten(),
