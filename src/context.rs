@@ -168,12 +168,25 @@ pub struct GitContext {
     pub untracked: usize,
 }
 
+/// Strip embedded credentials (`scheme://user:pass@host` → `scheme://host`)
+/// so a remote URL with a token never leaks into context output / LLM prompts.
+fn redact_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        if let Some(at) = url[scheme_end + 3..].find('@') {
+            let at = scheme_end + 3 + at;
+            return format!("{}{}", &url[..scheme_end + 3], &url[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 pub fn gather_git(base: &Path) -> Option<GitContext> {
     if !base.join(".git").exists() {
         return None;
     }
     let branch = capture_ok("git", &["branch", "--show-current"], base)?;
-    let remote_url = capture_ok("git", &["remote", "get-url", "origin"], base);
+    let remote_url =
+        capture_ok("git", &["remote", "get-url", "origin"], base).map(|u| redact_url(&u));
     let last_commit = capture_ok("git", &["log", "-1", "--format=%s"], base);
     let recent = capture_ok(
         "git",
@@ -1605,4 +1618,29 @@ pub fn format_simple(base: &Path) -> String {
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_strips_credentials() {
+        assert_eq!(
+            redact_url("https://user:token@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_url("https://ghp_secret@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_url("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_url("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+    }
 }
