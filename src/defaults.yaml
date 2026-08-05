@@ -58,9 +58,9 @@ projects:
       - name: Watch
         cmd: cargo watch -x clippy
         when: "bin('cargo-watch')"
+    run:
       - name: Run
-        cmd: cargo clippy
-        when: "!bin('cargo-watch')"
+        cmd: cargo run
 
   go:
     name: Go
@@ -102,6 +102,9 @@ projects:
       - name: Run
         cmd: go run .
         when: "!bin('air')"
+    run:
+      - name: Run
+        cmd: go run .
 
   nodejs:
     name: Node.js
@@ -147,6 +150,10 @@ projects:
       - name: Dev Server
         cmd: "{pm} run dev"
         when: "script('dev')"
+    run:
+      - name: Start
+        cmd: "{pm} start"
+        when: "script('start')"
 
   python:
     name: Python
@@ -192,6 +199,10 @@ projects:
         cmd: uv run pytest -q
         when: "glob('pyproject.toml') || glob('pytest.ini') || glob('setup.cfg')"
         cost: 10
+    run:
+      - name: Run
+        cmd: uv run python main.py
+        when: "glob('main.py')"
 
   jvm:
     name: Java/Kotlin

@@ -45,6 +45,7 @@ pub struct Commands {
     pub test: Vec<CommandDef>,
     pub install: Vec<CommandDef>,
     pub dev: Vec<CommandDef>,
+    pub run: Vec<CommandDef>,
 }
 
 impl Commands {
@@ -56,6 +57,7 @@ impl Commands {
             Kind::Test => &self.test,
             Kind::Install => &self.install,
             Kind::Dev => &self.dev,
+            Kind::Run => &self.run,
         }
     }
 
@@ -67,6 +69,7 @@ impl Commands {
             .chain(self.test.iter())
             .chain(self.install.iter())
             .chain(self.dev.iter())
+            .chain(self.run.iter())
     }
 }
 
@@ -85,6 +88,7 @@ pub enum Kind {
     Test,
     Install,
     Dev,
+    Run,
 }
 
 // ============ detector ============
@@ -145,6 +149,7 @@ impl Detector {
             test: build_cmds(&cfg.test, pm)?,
             install: build_cmds(&cfg.install, pm)?,
             dev: build_cmds(&cfg.dev, pm)?,
+            run: build_cmds(&cfg.run, pm)?,
         };
         for c in universal.all_cmds() {
             if let Some(w) = &c.when {
@@ -292,6 +297,8 @@ struct RepoConfig {
     install: Vec<CommandRaw>,
     #[serde(default)]
     dev: Vec<CommandRaw>,
+    #[serde(default)]
+    run: Vec<CommandRaw>,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +319,8 @@ struct ProjectRaw {
     install: Vec<CommandRaw>,
     #[serde(default)]
     dev: Vec<CommandRaw>,
+    #[serde(default)]
+    run: Vec<CommandRaw>,
 }
 
 #[derive(Deserialize)]
@@ -380,6 +389,7 @@ fn merge_pair(mut base: RepoConfig, over: RepoConfig) -> RepoConfig {
             merge_cmds(&mut b.test, p.test);
             merge_cmds(&mut b.install, p.install);
             merge_cmds(&mut b.dev, p.dev);
+            merge_cmds(&mut b.run, p.run);
         } else {
             base.projects.insert(id, p);
         }
@@ -390,6 +400,7 @@ fn merge_pair(mut base: RepoConfig, over: RepoConfig) -> RepoConfig {
     merge_cmds(&mut base.test, over.test);
     merge_cmds(&mut base.install, over.install);
     merge_cmds(&mut base.dev, over.dev);
+    merge_cmds(&mut base.run, over.run);
     base
 }
 
@@ -413,6 +424,7 @@ fn build_commands(p: &ProjectRaw, pm: &str) -> anyhow::Result<Commands> {
         test: build_cmds(&p.test, pm)?,
         install: build_cmds(&p.install, pm)?,
         dev: build_cmds(&p.dev, pm)?,
+        run: build_cmds(&p.run, pm)?,
     })
 }
 

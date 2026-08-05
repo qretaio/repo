@@ -106,3 +106,31 @@ fn run_group(cmds: &[CommandDef], opts: &RunOptions, mode: &Mode) -> bool {
         .collect();
     run_commands(&tasks, opts).iter().all(|r| r.success)
 }
+
+/// Live-run every detected project's commands for `kind` (dev servers / program
+/// execution). Output always streams; no cost filter; never fails the exit code.
+/// Shared by `dev` and `run` since their only real difference is the kind.
+pub fn live(d: &Detector, detected: &[&ProjectType], kind: Kind, header: &str) -> i32 {
+    let opts = RunOptions {
+        verbose: true,
+        ..Default::default()
+    };
+    println!("{}", header.bold());
+    for project in detected {
+        let commands = d.get_applicable(project.commands.get(kind));
+        if commands.is_empty() {
+            continue;
+        }
+        println!("{}", format!("\n{}:", project.name).blue());
+        let tasks: Vec<Task> = commands
+            .iter()
+            .map(|c| Task {
+                name: c.name.clone(),
+                cmd: c.cmd.clone(),
+                cost: c.cost,
+            })
+            .collect();
+        run_commands(&tasks, &opts);
+    }
+    0
+}

@@ -102,10 +102,9 @@ enum Cmd {
     /// npm run dev, cargo run, go run ., etc. Output is always streamed live.
     Dev(DevArgs),
 
-    /// Install dependencies, then start dev servers.
+    /// Run the project's program/binary.
     ///
-    /// Runs install commands for each detected project (if any), then starts
-    /// dev servers. Shortcut for `repo install && repo dev`.
+    /// cargo run, go run ., npm start, etc. Output always streams live.
     Run(RunArgs),
 
     /// Pack the repository into a single AI-friendly file (via repomix).

@@ -1,11 +1,12 @@
 //! Dev command — start development servers / watchers.
-//! Always streams output live (verbose) since dev servers are interactive.
+//! Always streams output live since dev servers are interactive.
 
-use crate::detect::{Detector, Kind};
-use crate::run::{run_commands, RunOptions, Task};
-use crate::Globals;
 use clap::Args;
 use colored::Colorize;
+
+use crate::commands::common::live;
+use crate::detect::{Detector, Kind};
+use crate::Globals;
 
 #[derive(Args)]
 pub struct DevArgs {
@@ -26,30 +27,5 @@ pub fn run(d: &Detector, _g: &Globals, args: &DevArgs) -> i32 {
         return 0;
     }
 
-    // Dev servers stream output live — always verbose.
-    let opts = RunOptions {
-        verbose: true,
-        ..Default::default()
-    };
-
-    println!("{}", "🚀 Starting dev servers".bold());
-
-    for project in &detected {
-        let commands = d.get_applicable(project.commands.get(Kind::Dev));
-        if commands.is_empty() {
-            continue;
-        }
-        println!("{}", format!("\n{}:", project.name).blue());
-        let tasks: Vec<Task> = commands
-            .iter()
-            .map(|c| Task {
-                name: c.name.clone(),
-                cmd: c.cmd.clone(),
-                cost: c.cost,
-            })
-            .collect();
-        run_commands(&tasks, &opts);
-    }
-
-    0
+    live(d, &detected, Kind::Dev, "🚀 Starting dev servers")
 }
