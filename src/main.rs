@@ -5,12 +5,13 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use std::process;
 mod commands;
+mod context;
 mod detect;
 mod run;
 
 use commands::{
-    build::BuildArgs, dev::DevArgs, fmt::FmtArgs, install::InstallArgs, lint::LintArgs,
-    mix::MixArgs, run::RunArgs, test::TestArgs,
+    build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, install::InstallArgs,
+    lint::LintArgs, mix::MixArgs, run::RunArgs, test::TestArgs,
 };
 use detect::Detector;
 
@@ -114,10 +115,11 @@ enum Cmd {
 
     /// Gather repository context for AI/LLM consumption.
     ///
-    /// NOT YET PORTED in the Rust rewrite (Phase 2); exits non-zero. Roll back
-    /// to the TS global to use it.
+    /// Collects git state, project metadata, code rules, dependency graph,
+    /// TODOs, file structure, and (optionally) tokei stats, semgrep analysis,
+    /// and vulnerability audits into a single AI-friendly document.
     #[command(alias = "ctx")]
-    Context,
+    Context(ContextArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -147,10 +149,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Dev(a) => commands::dev::run(&detector, &globals, &a),
         Cmd::Run(a) => commands::run::run(&detector, &globals, &a),
         Cmd::Mix(a) => commands::mix::run(&a),
-        Cmd::Context => {
-            eprintln!("repo context: not yet ported to Rust (planned for Phase 2).");
-            1
-        }
+        Cmd::Context(a) => commands::context::run(&detector, &globals, &a),
     };
 
     process::exit(code);

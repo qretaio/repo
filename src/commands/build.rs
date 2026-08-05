@@ -2,12 +2,11 @@
 //! Note: `--check` is cosmetic only (changes the header text); build never
 //! selects check_cmd variants — it always runs `cmd`. This mirrors the TS.
 
+use crate::commands::common::{execute, Mode, Plan};
+use crate::detect::{Detector, Kind};
+use crate::Globals;
 use clap::Args;
 use colored::Colorize;
-
-use crate::detect::{Detector, Kind};
-use crate::run::{run_commands, RunOptions, Task};
-use crate::Globals;
 
 #[derive(Args)]
 pub struct BuildArgs {
@@ -31,11 +30,6 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
         return 0;
     }
 
-    let opts = RunOptions {
-        verbose: g.verbose,
-        ..Default::default()
-    };
-
     if g.verbose {
         let h = format!(
             "{} projects{}",
@@ -53,31 +47,12 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
         println!("{}", h.bold());
     }
 
-    for project in &detected {
-        let commands: Vec<_> = d
-            .get_applicable(project.commands.get(Kind::Build))
-            .into_iter()
-            .filter(|c| c.cost <= g.cost)
-            .collect();
-        if commands.is_empty() {
-            continue;
-        }
-        if g.verbose {
-            println!("{}", format!("\n{}:", project.name).blue());
-        }
-        let tasks: Vec<Task> = commands
-            .iter()
-            .map(|c| Task {
-                name: c.name.clone(),
-                cmd: c.cmd.clone(),
-                cost: c.cost,
-            })
-            .collect();
-        let results = run_commands(&tasks, &opts);
-        if !results.iter().all(|r| r.success) {
-            return 1;
-        }
-    }
-
-    0
+    let plan = Plan {
+        kind: Kind::Build,
+        include_universal: false,
+        cost_filter: true,
+        continue_on_error: false,
+        mode: Mode::Normal,
+    };
+    execute(d, g, &detected, &plan).0
 }

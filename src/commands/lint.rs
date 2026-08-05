@@ -3,8 +3,8 @@
 use clap::Args;
 use colored::Colorize;
 
+use crate::commands::common::{execute, Mode, Plan};
 use crate::detect::{Detector, Kind};
-use crate::run::{run_commands, RunOptions, Task};
 use crate::Globals;
 
 #[derive(Args)]
@@ -38,16 +38,10 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         }
     }
 
-    let continue_on_error = args.fix;
     if !args.fix && detected.is_empty() {
         println!("{}", "No known project types detected".yellow());
         return 0;
     }
-
-    let opts = RunOptions {
-        verbose: g.verbose,
-        ..Default::default()
-    };
 
     if g.verbose {
         let mut h = String::from("🔍 Linting");
@@ -61,56 +55,12 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         println!("{}", h.blue());
     }
 
-    if args.r#type.is_none() {
-        let universal: Vec<_> = d
-            .get_applicable(d.universal_commands().get(Kind::Lint))
-            .into_iter()
-            .filter(|c| c.cost <= g.cost)
-            .collect();
-        if !universal.is_empty() {
-            if g.verbose {
-                println!("{}", "\nUniversal checks:".blue());
-            }
-            let tasks: Vec<Task> = universal
-                .iter()
-                .map(|c| Task {
-                    name: c.name.clone(),
-                    cmd: c.resolve_fix(args.fix).to_vec(),
-                    cost: c.cost,
-                })
-                .collect();
-            let results = run_commands(&tasks, &opts);
-            if !continue_on_error && !results.iter().all(|r| r.success) {
-                return 1;
-            }
-        }
-    }
-
-    for project in &detected {
-        let commands: Vec<_> = d
-            .get_applicable(project.commands.get(Kind::Lint))
-            .into_iter()
-            .filter(|c| c.cost <= g.cost)
-            .collect();
-        if commands.is_empty() {
-            continue;
-        }
-        if g.verbose {
-            println!("{}", format!("\n{}:", project.name).blue());
-        }
-        let tasks: Vec<Task> = commands
-            .iter()
-            .map(|c| Task {
-                name: c.name.clone(),
-                cmd: c.resolve_fix(args.fix).to_vec(),
-                cost: c.cost,
-            })
-            .collect();
-        let results = run_commands(&tasks, &opts);
-        if !continue_on_error && !results.iter().all(|r| r.success) {
-            return 1;
-        }
-    }
-
-    0
+    let plan = Plan {
+        kind: Kind::Lint,
+        include_universal: args.r#type.is_none(),
+        cost_filter: true,
+        continue_on_error: args.fix,
+        mode: Mode::Fix(args.fix),
+    };
+    execute(d, g, &detected, &plan).0
 }

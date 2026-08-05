@@ -3,8 +3,8 @@
 use clap::Args;
 use colored::Colorize;
 
-use crate::detect::{command_for_mode, Detector, Kind};
-use crate::run::{run_commands, RunOptions, Task};
+use crate::commands::common::{execute, Mode, Plan};
+use crate::detect::{Detector, Kind};
 use crate::Globals;
 
 #[derive(Args)]
@@ -24,21 +24,6 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
     }
 
     let detected = d.detect_project_types();
-    let universal: Vec<_> = d
-        .get_applicable(d.universal_commands().get(Kind::Fmt))
-        .into_iter()
-        .filter(|c| c.cost <= g.cost)
-        .collect();
-
-    if detected.is_empty() && universal.is_empty() {
-        println!("{}", "No formatters configured".yellow());
-        return 0;
-    }
-
-    let opts = RunOptions {
-        verbose: g.verbose,
-        ..Default::default()
-    };
 
     if g.verbose {
         let h = format!(
@@ -57,43 +42,17 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
         println!("{}", h.bold());
     }
 
-    if !universal.is_empty() {
-        if g.verbose {
-            println!("{}", "\nUniversal:".blue());
-        }
-        let tasks: Vec<Task> = universal
-            .iter()
-            .map(|c| Task {
-                name: c.name.clone(),
-                cmd: command_for_mode(c, args.check).to_vec(),
-                cost: c.cost,
-            })
-            .collect();
-        run_commands(&tasks, &opts);
+    // Formatting is best-effort: never fail the exit code.
+    let plan = Plan {
+        kind: Kind::Fmt,
+        include_universal: true,
+        cost_filter: true,
+        continue_on_error: true,
+        mode: Mode::Check(args.check),
+    };
+    let (_, ran) = execute(d, g, &detected, &plan);
+    if !ran {
+        println!("{}", "No formatters configured".yellow());
     }
-
-    for project in &detected {
-        let commands: Vec<_> = d
-            .get_applicable(project.commands.get(Kind::Fmt))
-            .into_iter()
-            .filter(|c| c.cost <= g.cost)
-            .collect();
-        if commands.is_empty() {
-            continue;
-        }
-        if g.verbose {
-            println!("{}", format!("\n{}:", project.name).blue());
-        }
-        let tasks: Vec<Task> = commands
-            .iter()
-            .map(|c| Task {
-                name: c.name.clone(),
-                cmd: command_for_mode(c, args.check).to_vec(),
-                cost: c.cost,
-            })
-            .collect();
-        run_commands(&tasks, &opts);
-    }
-
     0
 }

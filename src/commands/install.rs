@@ -1,7 +1,7 @@
 //! Install command — install/sync project dependencies.
 
+use crate::commands::common::{execute, Mode, Plan};
 use crate::detect::{Detector, Kind};
-use crate::run::{run_commands, RunOptions, Task};
 use crate::Globals;
 use clap::Args;
 use colored::Colorize;
@@ -25,38 +25,16 @@ pub fn run(d: &Detector, g: &Globals, args: &InstallArgs) -> i32 {
         return 0;
     }
 
-    let opts = RunOptions {
-        verbose: g.verbose,
-        ..Default::default()
+    let plan = Plan {
+        kind: Kind::Install,
+        include_universal: false,
+        cost_filter: false,
+        continue_on_error: false,
+        mode: Mode::Normal,
     };
-
-    let mut ran = false;
-    for project in &detected {
-        let commands = d.get_applicable(project.commands.get(Kind::Install));
-        if commands.is_empty() {
-            continue;
-        }
-        ran = true;
-        if g.verbose {
-            println!("{}", format!("\n{}:", project.name).blue());
-        }
-        let tasks: Vec<Task> = commands
-            .iter()
-            .map(|c| Task {
-                name: c.name.clone(),
-                cmd: c.cmd.clone(),
-                cost: c.cost,
-            })
-            .collect();
-        let results = run_commands(&tasks, &opts);
-        if !results.iter().all(|r| r.success) {
-            return 1;
-        }
-    }
-
-    if !ran {
+    let (code, ran) = execute(d, g, &detected, &plan);
+    if code == 0 && !ran {
         println!("{}", "No install commands for detected projects".yellow());
     }
-
-    0
+    code
 }
