@@ -44,7 +44,11 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
             } else {
                 "🔨 Building"
             },
-            if g.full { " (full)" } else { "" }
+            if g.cost > 0 {
+                format!(" (cost ≤ {})", g.cost)
+            } else {
+                String::new()
+            }
         );
         println!("{}", h.bold());
     }
@@ -53,7 +57,7 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
         let commands: Vec<_> = d
             .get_applicable(project.commands.get(Kind::Build))
             .into_iter()
-            .filter(|c| g.full || !c.heavy)
+            .filter(|c| c.cost <= g.cost)
             .collect();
         if commands.is_empty() {
             continue;
@@ -63,7 +67,11 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
         }
         let tasks: Vec<Task> = commands
             .iter()
-            .map(|c| Task::new(&c.name, &c.cmd))
+            .map(|c| Task {
+                name: c.name.clone(),
+                cmd: c.cmd.clone(),
+                cost: c.cost,
+            })
             .collect();
         let results = run_commands(&tasks, &opts);
         if !results.iter().all(|r| r.success) {

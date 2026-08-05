@@ -27,7 +27,7 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
     let universal: Vec<_> = d
         .get_applicable(d.universal_commands().get(Kind::Fmt))
         .into_iter()
-        .filter(|c| g.full || !c.heavy)
+        .filter(|c| c.cost <= g.cost)
         .collect();
 
     if detected.is_empty() && universal.is_empty() {
@@ -48,7 +48,11 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
             } else {
                 "✨ Formatting"
             },
-            if g.full { " (full)" } else { "" }
+            if g.cost > 0 {
+                format!(" (cost ≤ {})", g.cost)
+            } else {
+                String::new()
+            }
         );
         println!("{}", h.bold());
     }
@@ -59,7 +63,11 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
         }
         let tasks: Vec<Task> = universal
             .iter()
-            .map(|c| Task::new(&c.name, command_for_mode(c, args.check)))
+            .map(|c| Task {
+                name: c.name.clone(),
+                cmd: command_for_mode(c, args.check).to_vec(),
+                cost: c.cost,
+            })
             .collect();
         run_commands(&tasks, &opts);
     }
@@ -68,7 +76,7 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
         let commands: Vec<_> = d
             .get_applicable(project.commands.get(Kind::Fmt))
             .into_iter()
-            .filter(|c| g.full || !c.heavy)
+            .filter(|c| c.cost <= g.cost)
             .collect();
         if commands.is_empty() {
             continue;
@@ -78,7 +86,11 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
         }
         let tasks: Vec<Task> = commands
             .iter()
-            .map(|c| Task::new(&c.name, command_for_mode(c, args.check)))
+            .map(|c| Task {
+                name: c.name.clone(),
+                cmd: command_for_mode(c, args.check).to_vec(),
+                cost: c.cost,
+            })
             .collect();
         run_commands(&tasks, &opts);
     }

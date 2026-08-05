@@ -26,7 +26,7 @@ pub fn run(d: &Detector, g: &Globals, args: &TestArgs) -> i32 {
         return 0;
     }
 
-    // Always run all tests (heavy filter ignored — mirrors getCommandsByType).
+    // Always run all tests (cost filter ignored — mirrors getCommandsByType).
     let commands = d.get_commands_by_type(Kind::Test);
     if commands.is_empty() {
         println!("{}", "No testable projects detected".yellow());
@@ -52,7 +52,11 @@ pub fn run(d: &Detector, g: &Globals, args: &TestArgs) -> i32 {
             if args.watch && !cmd.iter().any(|a| a == "--watch") {
                 cmd.push("--watch".into());
             }
-            Task::new(&c.name, &cmd)
+            Task {
+                name: c.name.clone(),
+                cmd,
+                cost: c.cost,
+            }
         })
         .collect();
 

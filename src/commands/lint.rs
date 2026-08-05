@@ -55,8 +55,8 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
             h.push(' ');
             h.push_str(t);
         }
-        if g.full {
-            h.push_str(" (full scan)");
+        if g.cost > 0 {
+            h.push_str(&format!(" (cost ≤ {})", g.cost));
         }
         println!("{}", h.blue());
     }
@@ -65,7 +65,7 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         let universal: Vec<_> = d
             .get_applicable(d.universal_commands().get(Kind::Lint))
             .into_iter()
-            .filter(|c| g.full || !c.heavy)
+            .filter(|c| c.cost <= g.cost)
             .collect();
         if !universal.is_empty() {
             if g.verbose {
@@ -73,7 +73,11 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
             }
             let tasks: Vec<Task> = universal
                 .iter()
-                .map(|c| Task::new(&c.name, c.resolve_fix(args.fix)))
+                .map(|c| Task {
+                    name: c.name.clone(),
+                    cmd: c.resolve_fix(args.fix).to_vec(),
+                    cost: c.cost,
+                })
                 .collect();
             let results = run_commands(&tasks, &opts);
             if !continue_on_error && !results.iter().all(|r| r.success) {
@@ -86,7 +90,7 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         let commands: Vec<_> = d
             .get_applicable(project.commands.get(Kind::Lint))
             .into_iter()
-            .filter(|c| g.full || !c.heavy)
+            .filter(|c| c.cost <= g.cost)
             .collect();
         if commands.is_empty() {
             continue;
@@ -96,7 +100,11 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         }
         let tasks: Vec<Task> = commands
             .iter()
-            .map(|c| Task::new(&c.name, c.resolve_fix(args.fix)))
+            .map(|c| Task {
+                name: c.name.clone(),
+                cmd: c.resolve_fix(args.fix).to_vec(),
+                cost: c.cost,
+            })
             .collect();
         let results = run_commands(&tasks, &opts);
         if !continue_on_error && !results.iter().all(|r| r.success) {

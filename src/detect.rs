@@ -1,57 +1,32 @@
-//! Project detection module — detects project types and available commands.
-//! Built-in detection is marker-file based; rich boolean detection (AND/OR,
-//! source-layout, marker-content) is configurable via CEL expressions in
-//! `repo.toml` (see [`CompiledRule`] / [`Detector::load_rules`]).
+//! Project detection + command tables — fully data-driven.
+//!
+//! Detection rules and command definitions live in an embedded YAML
+//! (`defaults.yaml`), overridable by `~/.config/repo/repo.yaml` (global) and
+//! `./repo.yaml` (local). CEL expressions power both *detection* (`detect`
+//! field) and per-command *conditions* (`when` field). See the header of
+//! `defaults.yaml` for the host-function reference.
 
 use anyhow::Context as _;
 use cel_interpreter::{Context, Program, Value};
 use colored::Colorize;
+use indexmap::IndexMap;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Predicate over the detector. Pure (captures nothing) so it coerces to a fn pointer.
-pub type Pred = fn(&Detector) -> bool;
-
 #[derive(Clone)]
 pub struct CommandDef {
     pub name: String,
     pub cmd: Vec<String>,
-    pub only_if: Option<Pred>,
+    when: Option<Arc<Program>>,
     pub check_cmd: Option<Vec<String>>,
     pub fix_cmd: Option<Vec<String>>,
-    pub heavy: bool,
+    pub cost: u32,
 }
 
 impl CommandDef {
-    fn new(name: &str, cmd: &[&str]) -> Self {
-        Self {
-            name: name.to_string(),
-            cmd: cmd.iter().map(|s| s.to_string()).collect(),
-            only_if: None,
-            check_cmd: None,
-            fix_cmd: None,
-            heavy: false,
-        }
-    }
-    fn when(mut self, p: Pred) -> Self {
-        self.only_if = Some(p);
-        self
-    }
-    fn heavy(mut self) -> Self {
-        self.heavy = true;
-        self
-    }
-    fn fix(mut self, c: &[&str]) -> Self {
-        self.fix_cmd = Some(c.iter().map(|s| s.to_string()).collect());
-        self
-    }
-    fn check(mut self, c: &[&str]) -> Self {
-        self.check_cmd = Some(c.iter().map(|s| s.to_string()).collect());
-        self
-    }
     /// Lint-style mode resolution: use `fix_cmd` when fixing, else `cmd`.
     pub fn resolve_fix(&self, fix: bool) -> &[String] {
         if fix {
@@ -68,24 +43,8 @@ pub struct Commands {
     pub fmt: Vec<CommandDef>,
     pub build: Vec<CommandDef>,
     pub test: Vec<CommandDef>,
-}
-
-#[derive(Clone)]
-pub struct ProjectType {
-    pub name: String,
-    pub id: String,
-    /// Built-in fallback: project is detected when ANY of these entries exist.
-    /// A `repo.toml` `[[detect]]` rule with the same `id` overrides this.
-    pub detect_files: &'static [&'static str],
-    pub commands: Commands,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Lint,
-    Fmt,
-    Build,
-    Test,
+    pub install: Vec<CommandDef>,
+    pub dev: Vec<CommandDef>,
 }
 
 impl Commands {
@@ -95,554 +54,135 @@ impl Commands {
             Kind::Fmt => &self.fmt,
             Kind::Build => &self.build,
             Kind::Test => &self.test,
+            Kind::Install => &self.install,
+            Kind::Dev => &self.dev,
         }
+    }
+
+    fn all_cmds(&self) -> impl Iterator<Item = &CommandDef> {
+        self.lint
+            .iter()
+            .chain(self.fmt.iter())
+            .chain(self.build.iter())
+            .chain(self.test.iter())
+            .chain(self.install.iter())
+            .chain(self.dev.iter())
     }
 }
 
-/// Holds pre-parsed project state so predicates are cheap and deterministic.
+pub struct ProjectType {
+    pub id: String,
+    pub name: String,
+    detect: Arc<Program>,
+    pub commands: Commands,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Lint,
+    Fmt,
+    Build,
+    Test,
+    Install,
+    Dev,
+}
+
+// ============ detector ============
+
 pub struct Detector {
-    cwd: PathBuf,
-    /// All immediate entries of `cwd`, scanned once at construction. Every
-    /// `exists()` call is an O(1) set lookup instead of a `stat` syscall.
-    entries: HashSet<String>,
-    pkg: Option<serde_json::Value>,
-    pyproject: Option<String>,
-    requirements: Option<String>,
-    node_pm: Option<&'static str>,
-    #[allow(dead_code)] // Phase 2: detectProjectTypeFlags.packageManager
-    python_pm: Option<&'static str>,
-    /// Compiled `repo.toml` `[[detect]]` rules. Override built-in detection by
-    /// `id`, or declare new detect-only project types. Empty when no config.
-    rules: Vec<CompiledRule>,
+    projects: Vec<ProjectType>,
+    universal: Commands,
+    cel: Context<'static>,
 }
 
 impl Detector {
     pub fn new(cwd: PathBuf) -> anyhow::Result<Self> {
-        let entries = scan_entries(&cwd);
-        // Read file contents only when the file actually exists.
-        let read = |rel: &str| -> Option<String> {
-            if entries.contains(rel) {
-                fs::read_to_string(cwd.join(rel)).ok()
-            } else {
-                None
+        std::env::set_current_dir(find_root(&cwd))?;
+
+        let pkg = read_json("package.json");
+        let pm = detect_package_manager().unwrap_or("npm");
+        let cfg = load_config()?;
+        let mut cel = cel_context(&pkg);
+
+        // Phase 2 — compile detect exprs, build projects, evaluate detection.
+        let mut projects = Vec::with_capacity(cfg.projects.len());
+        let mut detected = HashSet::new();
+        for (id, p) in &cfg.projects {
+            let detect = Arc::new(compile_cel(&p.detect, id)?);
+            validate_bool(&detect, &cel, id)?;
+            if eval_bool(&detect, &cel) {
+                detected.insert(id.clone());
             }
-        };
-        let pyproject = read("pyproject.toml");
-        let pkg = read("package.json").and_then(|s| serde_json::from_str(&s).ok());
-        let requirements = read("requirements.txt");
-        let node_pm = detect_package_manager(&entries);
-        let python_pm = detect_python_package_manager(&entries, &pyproject);
-        let rules = load_rules(&cwd)?;
-        // Fail loud: every rule must compile (done in load_rules) AND evaluate
-        // to a bool against this snapshot, so a typo'd host function or a
-        // non-boolean expression is caught at startup, not mid-lint.
-        for rule in &rules {
-            let ctx = cel_context(&cwd, &entries);
-            match rule.program.execute(&ctx) {
-                Ok(Value::Bool(_)) => {}
-                Ok(v) => anyhow::bail!(
-                    "repo.toml detect[{}]: expression must evaluate to bool, got {:?}",
-                    rule.id,
-                    v
-                ),
-                Err(e) => anyhow::bail!("repo.toml detect[{}]: {}", rule.id, e),
+            let commands = build_commands(p, pm)?;
+            projects.push(ProjectType {
+                name: p.name.clone().unwrap_or_else(|| id.clone()),
+                id: id.clone(),
+                detect,
+                commands,
+            });
+        }
+
+        // Phase 3 — expose detection results to command `when` expressions.
+        let det = Arc::new(detected);
+        cel.add_function("project", move |id: Arc<String>| -> bool {
+            det.contains(id.as_str())
+        });
+
+        // Phase 4 — validate every `when` expression (project() now available).
+        for p in &projects {
+            for c in p.commands.all_cmds() {
+                if let Some(w) = &c.when {
+                    validate_bool(w, &cel, &format!("{}.{}", p.id, c.name))?;
+                }
             }
         }
+
+        // Phase 5 — build + validate universal commands.
+        let universal = Commands {
+            lint: build_cmds(&cfg.lint, pm)?,
+            fmt: build_cmds(&cfg.fmt, pm)?,
+            build: build_cmds(&cfg.build, pm)?,
+            test: build_cmds(&cfg.test, pm)?,
+            install: build_cmds(&cfg.install, pm)?,
+            dev: build_cmds(&cfg.dev, pm)?,
+        };
+        for c in universal.all_cmds() {
+            if let Some(w) = &c.when {
+                validate_bool(w, &cel, &format!("universal.{}", c.name))?;
+            }
+        }
+
         Ok(Self {
-            cwd,
-            entries,
-            pkg,
-            pyproject,
-            requirements,
-            node_pm,
-            python_pm,
-            rules,
+            projects,
+            universal,
+            cel,
         })
     }
 
-    /// O(1) membership check against the single up-front directory scan.
-    /// Only meaningful for immediate entries of `cwd` (all callers pass bare
-    /// filenames); nested paths use `has_files_with_ext` / `read`.
-    fn exists(&self, rel: &str) -> bool {
-        self.entries.contains(rel)
-    }
-
-    fn read(&self, rel: &str) -> Option<String> {
-        fs::read_to_string(self.cwd.join(rel)).ok()
-    }
-
-    fn node_pm_or(&self, default: &str) -> String {
-        self.node_pm.unwrap_or(default).to_string()
-    }
-
-    fn has_files_with_ext(&self, dir: &str, ext: &str) -> bool {
-        dir_has_ext(&self.cwd.join(dir), ext)
-    }
-
-    #[allow(dead_code)] // Phase 2: detectProjectTypeFlags (frameworks)
-    fn has_dependency(&self, dep: &str) -> bool {
-        let Some(pkg) = &self.pkg else {
-            return false;
-        };
-        for field in ["dependencies", "devDependencies"] {
-            if let Some(obj) = pkg.get(field).and_then(|v| v.as_object()) {
-                for name in obj.keys() {
-                    if name == dep || name.starts_with(&format!("{dep}/")) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    #[allow(dead_code)] // Phase 2: detectProjectTypeFlags (django)
-    fn has_python_dependency(&self, dep: &str) -> bool {
-        let Some(content) = &self.pyproject else {
-            return false;
-        };
-        python_dep_match(content, dep)
-    }
-
-    #[allow(dead_code)] // Phase 2: detectProjectTypeFlags (django)
-    fn has_requirements_dependency(&self, dep: &str) -> bool {
-        let Some(content) = &self.requirements else {
-            return false;
-        };
-        content.lines().any(|line| {
-            let t = line.trim_start();
-            t.starts_with(dep) && t[dep.len()..].starts_with(['=', '<', '>', '~'])
-        })
-    }
-
-    fn has_script(&self, script: &str) -> bool {
-        self.pkg
-            .as_ref()
-            .and_then(|p| p.get("scripts"))
-            .and_then(|s| s.get(script))
-            .is_some()
-    }
-
-    fn has_typescript(&self) -> bool {
-        ["tsconfig.json", "tsconfig.base.json", "tsconfig.build.json"]
+    pub fn detect_project_types(&self) -> Vec<&ProjectType> {
+        self.projects
             .iter()
-            .any(|f| self.exists(f))
+            .filter(|p| eval_bool(&p.detect, &self.cel))
+            .collect()
     }
 
-    fn has_eslint(&self) -> bool {
-        [
-            ".eslintrc.js",
-            ".eslintrc.json",
-            ".eslintrc.yaml",
-            ".eslintrc.yml",
-            ".eslintrc",
-            "eslint.config.js",
-            "eslint.config.mjs",
-            "eslint.config.cjs",
-        ]
-        .iter()
-        .any(|f| self.exists(f))
-    }
-
-    fn has_prettier(&self) -> bool {
-        [
-            ".prettierrc",
-            ".prettierrc.json",
-            ".prettierrc.yaml",
-            ".prettierrc.yml",
-            ".prettierrc.json5",
-            ".prettierrc.js",
-            ".prettierrc.cjs",
-            "prettier.config.js",
-            "prettier.config.cjs",
-        ]
-        .iter()
-        .any(|f| self.exists(f))
-    }
-
-    fn has_spotless(&self) -> bool {
-        (self.exists("build.gradle") || self.exists("build.gradle.kts"))
-            && self
-                .read(if self.exists("build.gradle") {
-                    "build.gradle"
-                } else {
-                    "build.gradle.kts"
-                })
-                .unwrap_or_default()
-                .contains("spotless")
-    }
-
-    pub fn detect_project_types(&self) -> Vec<ProjectType> {
-        let ctx = cel_context(&self.cwd, &self.entries);
-        let mut out: Vec<ProjectType> = Vec::new();
-        // Built-ins: a config rule with the same id overrides marker-file
-        // detection; otherwise fall back to detect_files.
-        for mut p in self.all_project_types() {
-            match self.rules.iter().find(|r| r.id == p.id) {
-                Some(rule) if rule.eval_bool(&ctx) => {
-                    if !rule.name.is_empty() {
-                        p.name = rule.name.clone();
-                    }
-                    out.push(p);
-                }
-                None if p.detect_files.iter().any(|f| self.exists(f)) => out.push(p),
-                _ => {}
-            }
-        }
-        // Config-only types (id not built-in): detected, but carry no commands
-        // until command tables are also configurable (future work).
-        for rule in &self.rules {
-            if self.all_project_types().iter().any(|p| p.id == rule.id) {
-                continue;
-            }
-            if rule.eval_bool(&ctx) {
-                out.push(ProjectType {
-                    name: rule.name.clone(),
-                    id: rule.id.clone(),
-                    detect_files: &[],
-                    commands: Commands::default(),
-                });
-            }
-        }
-        out
-    }
-
-    /// All five project types, unconditionally built (table source of truth).
-    fn all_project_types(&self) -> Vec<ProjectType> {
-        let npm = self.node_pm_or("npm");
-        vec![
-            self.node_project(&npm),
-            self.python_project(),
-            self.rust_project(),
-            self.go_project(),
-            self.jvm_project(),
-        ]
-    }
-
-    fn node_project(&self, npm: &str) -> ProjectType {
-        ProjectType {
-            name: "Node.js".into(),
-            id: "nodejs".into(),
-            detect_files: &["package.json"],
-            commands: Commands {
-                lint: vec![
-                    CommandDef::new("ESLint", &["npx", "eslint", "."])
-                        .fix(&["npx", "eslint", "--fix", "."])
-                        .when(|d| d.has_eslint()),
-                    CommandDef::new("Type Check", &["npx", "tsc", "--noEmit"])
-                        .when(|d| d.has_typescript()),
-                    CommandDef::new("Format Check", &["npx", "prettier", "--check", "."])
-                        .fix(&["npx", "prettier", "--write", "."])
-                        .when(|d| d.has_prettier()),
-                    CommandDef::new("Security Audit", &[npm, "audit"])
-                        .when(|d| d.exists("package.json"))
-                        .heavy(),
-                ],
-                fmt: vec![
-                    CommandDef::new(
-                        "Prettier",
-                        &["npx", "prettier", "--log-level", "warn", "--write", "."],
-                    )
-                    .check(&["npx", "prettier", "--log-level", "warn", "--check", "."])
-                    .when(|d| d.has_prettier()),
-                    CommandDef::new("ESLint --fix", &["npx", "eslint", "--fix", "."])
-                        .when(|d| d.has_eslint()),
-                ],
-                build: vec![
-                    CommandDef::new("Build", &[npm, "run", "build"])
-                        .when(|d| d.has_script("build"))
-                        .heavy(),
-                    CommandDef::new("TypeScript", &["npx", "-y", "tsc", "--noEmit"])
-                        .when(|d| d.has_typescript()),
-                ],
-                test: vec![CommandDef::new("Tests", &[npm, "test"])
-                    .when(|d| d.has_script("test"))
-                    .heavy()],
-            },
-        }
-    }
-
-    fn python_project(&self) -> ProjectType {
-        ProjectType {
-            name: "Python".into(),
-            id: "python".into(),
-            detect_files: &[
-                "pyproject.toml",
-                "requirements.txt",
-                ".python-version",
-                "setup.py",
-            ],
-            commands: Commands {
-                lint: vec![
-                    CommandDef::new("Ruff", &["uv", "run", "ruff", "check", "."])
-                        .fix(&["uv", "run", "ruff", "check", "--fix", "."])
-                        .when(py_ruff),
-                    CommandDef::new("Mypy", &["uv", "run", "mypy", "."]).when(|d| {
-                        d.exists("mypy.ini")
-                            || d.exists(".mypy.ini")
-                            || (d.exists("pyproject.toml")
-                                && d.read("pyproject.toml")
-                                    .unwrap_or_default()
-                                    .contains("[tool.mypy]"))
-                    }),
-                    CommandDef::new(
-                        "Format Check",
-                        &["uv", "run", "ruff", "format", "--check", "."],
-                    )
-                    .fix(&["uv", "run", "ruff", "format", "."])
-                    .when(py_ruff),
-                    CommandDef::new("Pylint", &["uv", "run", "pylint", "."])
-                        .when(|d| d.exists("pylintrc") || d.exists(".pylintrc"))
-                        .heavy(),
-                    CommandDef::new("Security Audit", &["uv", "run", "pip-audit"])
-                        .when(|d| d.exists("pyproject.toml") || d.exists("requirements.txt"))
-                        .heavy(),
-                ],
-                fmt: vec![
-                    CommandDef::new("Ruff format", &["uv", "run", "ruff", "format", "."])
-                        .check(&["uv", "run", "ruff", "format", "--check", "."])
-                        .when(py_ruff),
-                    CommandDef::new("Black", &["uv", "run", "black", "."])
-                        .check(&["uv", "run", "black", "--check", "."])
-                        .when(|d| d.exists("pyproject.toml")),
-                ],
-                build: vec![CommandDef::new("Build", &["uv", "build", "."])
-                    .when(|d| d.exists("pyproject.toml"))
-                    .heavy()],
-                test: vec![CommandDef::new("Pytest", &["uv", "run", "pytest", "-q"])
-                    .when(|d| {
-                        d.exists("pyproject.toml")
-                            || d.exists("pytest.ini")
-                            || d.exists("setup.cfg")
-                    })
-                    .heavy()],
-            },
-        }
-    }
-
-    fn rust_project(&self) -> ProjectType {
-        ProjectType {
-            name: "Rust".into(),
-            id: "rust".into(),
-            detect_files: &["Cargo.toml"],
-            commands: Commands {
-                lint: vec![
-                    CommandDef::new(
-                        "Clippy",
-                        &["cargo", "clippy", "--all-targets", "--", "-D", "warnings"],
-                    ),
-                    CommandDef::new("Security Audit", &["cargo", "audit"])
-                        .when(|d| d.exists("Cargo.lock"))
-                        .heavy(),
-                    CommandDef::new("Format Check", &["cargo", "fmt", "--", "--check"])
-                        .fix(&["cargo", "fmt"]),
-                ],
-                fmt: vec![CommandDef::new("Format", &["cargo", "fmt"])
-                    .check(&["cargo", "fmt", "--", "--check"])],
-                build: vec![
-                    CommandDef::new("Build", &["cargo", "build"]).heavy(),
-                    CommandDef::new("Check (faster)", &["cargo", "check"]),
-                ],
-                test: vec![CommandDef::new("Tests", &["cargo", "test"]).heavy()],
-            },
-        }
-    }
-
-    fn go_project(&self) -> ProjectType {
-        ProjectType {
-            name: "Go".into(),
-            id: "go".into(),
-            detect_files: &["go.mod"],
-            commands: Commands {
-                lint: vec![
-                    CommandDef::new("Vet", &["go", "vet", "./..."]),
-                    CommandDef::new(
-                        "Security Audit",
-                        &[
-                            "go",
-                            "run",
-                            "golang.org/x/vuln/cmd/govulncheck@latest",
-                            "./...",
-                        ],
-                    )
-                    .when(|d| d.exists("go.mod"))
-                    .heavy(),
-                    CommandDef::new("golangci-lint", &["golangci-lint", "run"])
-                        .when(|d| {
-                            d.exists(".golangci.yml")
-                                || d.exists(".golangci.yaml")
-                                || d.exists(".golangci.toml")
-                                || d.exists(".golangci.json")
-                        })
-                        .heavy(),
-                    CommandDef::new(
-                        "Staticcheck",
-                        &[
-                            "go",
-                            "run",
-                            "honnef.co/go/tools/cmd/staticcheck@latest",
-                            "./...",
-                        ],
-                    )
-                    .when(|d| d.exists("go.mod")),
-                ],
-                fmt: vec![
-                    CommandDef::new("Format", &["gofmt", "-w", "."]).check(&["gofmt", "-l", "."])
-                ],
-                build: vec![CommandDef::new("Build", &["go", "build", "./..."]).heavy()],
-                test: vec![CommandDef::new("Tests", &["go", "test", "./..."]).heavy()],
-            },
-        }
-    }
-
-    fn jvm_project(&self) -> ProjectType {
-        let is_maven = self.exists("pom.xml");
-        let build_cmd = if is_maven {
-            vec!["mvn", "compile"]
-        } else {
-            vec!["./gradlew", "build"]
-        };
-        let test_cmd = if is_maven {
-            vec!["mvn", "test"]
-        } else {
-            vec!["./gradlew", "test"]
-        };
-        ProjectType {
-            name: "Java/Kotlin".into(),
-            id: "jvm".into(),
-            detect_files: &[
-                "build.gradle",
-                "build.gradle.kts",
-                "pom.xml",
-                "settings.gradle",
-            ],
-            commands: Commands {
-                lint: vec![
-                    CommandDef::new("Checkstyle", &["./gradlew", "checkstyleMain"])
-                        .when(|d| d.exists("build.gradle") || d.exists("build.gradle.kts")),
-                    CommandDef::new("Detekt", &["./gradlew", "detekt"])
-                        .when(|d| d.exists("detekt.yml") || d.exists(".detekt.yml")),
-                    CommandDef::new("Format Check", &["./gradlew", "spotlessCheck"])
-                        .fix(&["./gradlew", "spotlessApply"])
-                        .when(|d| d.has_spotless()),
-                ],
-                fmt: vec![
-                    CommandDef::new("Spotless apply", &["./gradlew", "spotlessApply"])
-                        .check(&["./gradlew", "spotlessCheck"])
-                        .when(|d| d.exists("build.gradle") || d.exists("build.gradle.kts")),
-                ],
-                build: vec![CommandDef::new("Build", &build_cmd).heavy()],
-                test: vec![CommandDef::new("Tests", &test_cmd).heavy()],
-            },
-        }
-    }
-
-    pub fn universal_commands(&self) -> Commands {
-        let npm = self.node_pm_or("npm");
-        Commands {
-            lint: vec![
-                CommandDef::new(
-                    "Semgrep",
-                    &["npx", "-y", "semgrep", "scan", "--config", "auto"],
-                )
-                .heavy(),
-                CommandDef::new("Knip", &["npx", "knip"])
-                    .when(|d| {
-                        d.exists("knip.json")
-                            || d.exists("knip.jsonc")
-                            || d.exists("knip.config.js")
-                            || d.exists("knip.config.ts")
-                            || (d.exists("package.json")
-                                && d.read("package.json")
-                                    .unwrap_or_default()
-                                    .contains("\"knip\""))
-                    })
-                    .heavy(),
-                CommandDef::new(
-                    "Secrets (Gitleaks)",
-                    &["gitleaks", "detect", "--verbose", "--redact", "--no-git"],
-                )
-                .when(has_gitleaks)
-                .heavy(),
-                CommandDef::new(
-                    "Security (Trivy)",
-                    &["trivy", "fs", ".", "--severity", "HIGH,CRITICAL"],
-                )
-                .when(has_trivy)
-                .heavy(),
-                CommandDef::new(
-                    "Secrets (Trufflehog)",
-                    &["trufflehog", "filesystem", ".", "--only-verified"],
-                )
-                .when(has_trufflehog)
-                .heavy(),
-                CommandDef::new(
-                    "DESIGN.md",
-                    &["npx", "-y", "@google/design.md", "lint", "DESIGN.md"],
-                )
-                .when(|d| d.exists("DESIGN.md")),
-                CommandDef::new(
-                    "Shell",
-                    &["npx", "-y", "shellcheck", "scripts/*.sh", "bin/*.sh"],
-                )
-                .when(|d| {
-                    d.has_files_with_ext("scripts", ".sh") || d.has_files_with_ext("bin", ".sh")
-                }),
-                CommandDef::new(
-                    "Markdown",
-                    &["npx", "-y", "markdownlint-cli2", "**/*.md", "#node_modules"],
-                )
-                .when(|d| {
-                    d.exists(".markdownlint.json")
-                        || d.exists(".markdownlint.yaml")
-                        || d.exists(".markdownlint.yml")
-                        || d.exists(".markdownlint-cli2.jsonc")
-                }),
-                CommandDef::new("Format Check", &["npx", "prettier", "--check", "."])
-                    .fix(&["npx", "prettier", "--write", "."])
-                    .when(|d| {
-                        d.has_prettier()
-                            && !d.detect_project_types().iter().any(|p| p.id == "nodejs")
-                    }),
-            ],
-            fmt: vec![
-                CommandDef::new(
-                    "Prettier",
-                    &["npx", "prettier", "--log-level", "warn", "--write", "."],
-                )
-                .check(&["npx", "prettier", "--log-level", "warn", "--check", "."])
-                .when(|d| d.has_prettier()),
-                CommandDef::new("Dprint", &["npx", "-y", "dprint", "fmt"])
-                    .check(&["npx", "-y", "dprint", "check"])
-                    .when(|d| d.exists("dprint.json") || d.exists("dprint.jsonc")),
-            ],
-            build: vec![],
-            test: vec![CommandDef::new("Tests", &[npm.as_str(), "test"])
-                .when(|d| {
-                    d.has_script("test")
-                        && !d.detect_project_types().iter().any(|p| p.id == "nodejs")
-                })
-                .heavy()],
-        }
+    pub fn universal_commands(&self) -> &Commands {
+        &self.universal
     }
 
     pub fn get_applicable(&self, cmds: &[CommandDef]) -> Vec<CommandDef> {
         cmds.iter()
-            .filter(|c| match c.only_if {
-                Some(p) => p(self),
-                None => true,
-            })
+            .filter(|c| c.when.as_ref().is_none_or(|w| eval_bool(w, &self.cel)))
             .cloned()
             .collect()
     }
 
     pub fn get_commands_by_type(&self, kind: Kind) -> Vec<CommandDef> {
         let detected = self.detect_project_types();
-        let mut out: Vec<CommandDef> = self.get_applicable(self.universal_commands().get(kind));
+        let mut out: Vec<CommandDef> = self.get_applicable(self.universal.get(kind));
         let multi = detected.len() > 1;
         for project in &detected {
-            for cmd in self.get_applicable(project.commands.get(kind)) {
-                let mut cmd = cmd;
+            for mut cmd in self.get_applicable(project.commands.get(kind)) {
                 if multi {
                     cmd.name = format!("{}: {}", project.name, cmd.name);
                 }
@@ -655,7 +195,7 @@ impl Detector {
     pub fn list_commands(&self, kind: Kind, label: &str, include_universal: bool) {
         let detected = self.detect_project_types();
         let universal = if include_universal {
-            self.get_applicable(self.universal_commands().get(kind))
+            self.get_applicable(self.universal.get(kind))
         } else {
             vec![]
         };
@@ -701,172 +241,272 @@ pub fn command_for_mode(cmd: &CommandDef, check_mode: bool) -> &[String] {
     &cmd.cmd
 }
 
-// ---- package managers ----
+// ---- project root + file helpers ----
 
-fn scan_entries(dir: &Path) -> HashSet<String> {
-    match fs::read_dir(dir) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect(),
-        Err(_) => HashSet::new(),
+/// Walk up from `start` to the nearest directory containing `.git`.
+/// Falls back to `start` itself if none found (non-Git projects).
+fn find_root(start: &Path) -> PathBuf {
+    for dir in start.ancestors() {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
     }
+    start.to_path_buf()
 }
 
-fn detect_package_manager(entries: &HashSet<String>) -> Option<&'static str> {
-    if entries.contains("pnpm-lock.yaml") {
+fn read_json(rel: &str) -> Option<serde_json::Value> {
+    fs::read_to_string(rel)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn detect_package_manager() -> Option<&'static str> {
+    if Path::new("pnpm-lock.yaml").exists() {
         Some("pnpm")
-    } else if entries.contains("yarn.lock") {
+    } else if Path::new("yarn.lock").exists() {
         Some("yarn")
-    } else if entries.contains("bun.lockb") {
+    } else if Path::new("bun.lockb").exists() {
         Some("bun")
-    } else if entries.contains("package-lock.json") {
+    } else if Path::new("package-lock.json").exists() {
         Some("npm")
     } else {
         None
     }
 }
 
-fn detect_python_package_manager(
-    entries: &HashSet<String>,
-    pyproject: &Option<String>,
-) -> Option<&'static str> {
-    if entries.contains("uv.lock") {
-        Some("uv")
-    } else if entries.contains("requirements.txt") || entries.contains("requirements.lock") {
-        Some("pip")
-    } else if let Some(content) = pyproject {
-        if content.contains("[tool.uv]") {
-            Some("uv")
-        } else {
-            None
+const DEFAULTS: &str = include_str!("defaults.yaml");
+
+#[derive(Deserialize, Default)]
+struct RepoConfig {
+    #[serde(default)]
+    projects: IndexMap<String, ProjectRaw>,
+    #[serde(default)]
+    lint: Vec<CommandRaw>,
+    #[serde(default)]
+    fmt: Vec<CommandRaw>,
+    #[serde(default)]
+    build: Vec<CommandRaw>,
+    #[serde(default)]
+    test: Vec<CommandRaw>,
+    #[serde(default)]
+    install: Vec<CommandRaw>,
+    #[serde(default)]
+    dev: Vec<CommandRaw>,
+}
+
+#[derive(Deserialize)]
+struct ProjectRaw {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    detect: String,
+    #[serde(default)]
+    lint: Vec<CommandRaw>,
+    #[serde(default)]
+    fmt: Vec<CommandRaw>,
+    #[serde(default)]
+    build: Vec<CommandRaw>,
+    #[serde(default)]
+    test: Vec<CommandRaw>,
+    #[serde(default)]
+    install: Vec<CommandRaw>,
+    #[serde(default)]
+    dev: Vec<CommandRaw>,
+}
+
+#[derive(Deserialize)]
+struct CommandRaw {
+    name: String,
+    cmd: String,
+    #[serde(default)]
+    when: Option<String>,
+    #[serde(default)]
+    fix: Option<String>,
+    #[serde(default)]
+    check: Option<String>,
+    #[serde(default)]
+    cost: u32,
+}
+
+fn load_config() -> anyhow::Result<RepoConfig> {
+    let mut configs = Vec::new();
+
+    configs.push(parse_yaml(DEFAULTS, "embedded defaults")?);
+
+    if let Some(dir) = global_config_dir() {
+        let path = dir.join("repo.yaml");
+        if let Ok(content) = fs::read_to_string(&path) {
+            configs.push(parse_yaml(&content, &path.display().to_string())?);
         }
-    } else {
-        None
+    }
+
+    if let Ok(content) = fs::read_to_string("repo.yaml") {
+        configs.push(parse_yaml(&content, "repo.yaml")?);
+    }
+
+    Ok(configs.into_iter().reduce(merge_pair).unwrap_or_default())
+}
+
+fn parse_yaml(content: &str, source: &str) -> anyhow::Result<RepoConfig> {
+    serde_yaml::from_str(content).with_context(|| format!("failed to parse {source}"))
+}
+
+fn global_config_dir() -> Option<PathBuf> {
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+        .map(|p| p.join("repo"))
+}
+
+/// Deep-merge `over` into `base`. Projects merge by id; command lists
+/// merge by name (replace existing, append new).
+fn merge_pair(mut base: RepoConfig, over: RepoConfig) -> RepoConfig {
+    for (id, p) in over.projects {
+        if let Some(b) = base.projects.get_mut(&id) {
+            if !p.detect.is_empty() {
+                b.detect = p.detect;
+            }
+            if p.name.is_some() {
+                b.name = p.name;
+            }
+            merge_cmds(&mut b.lint, p.lint);
+            merge_cmds(&mut b.fmt, p.fmt);
+            merge_cmds(&mut b.build, p.build);
+            merge_cmds(&mut b.test, p.test);
+            merge_cmds(&mut b.install, p.install);
+            merge_cmds(&mut b.dev, p.dev);
+        } else {
+            base.projects.insert(id, p);
+        }
+    }
+    merge_cmds(&mut base.lint, over.lint);
+    merge_cmds(&mut base.fmt, over.fmt);
+    merge_cmds(&mut base.build, over.build);
+    merge_cmds(&mut base.test, over.test);
+    merge_cmds(&mut base.install, over.install);
+    merge_cmds(&mut base.dev, over.dev);
+    base
+}
+
+fn merge_cmds(base: &mut Vec<CommandRaw>, over: Vec<CommandRaw>) {
+    for cmd in over {
+        if let Some(i) = base.iter().position(|c| c.name == cmd.name) {
+            base[i] = cmd;
+        } else {
+            base.push(cmd);
+        }
     }
 }
 
-// ---- free predicates (coerce to fn pointers) ----
+// ============ command building ============
 
-fn py_ruff(d: &Detector) -> bool {
-    d.exists("pyproject.toml") || d.exists(".ruff.toml") || d.exists("ruff.toml")
-}
-
-fn has_gitleaks(_d: &Detector) -> bool {
-    which::which("gitleaks").is_ok()
-}
-fn has_trivy(_d: &Detector) -> bool {
-    which::which("trivy").is_ok()
-}
-fn has_trufflehog(_d: &Detector) -> bool {
-    which::which("trufflehog").is_ok()
-}
-
-/// Mirrors hasPythonDependency: matches `^dep[=<>~]`, `"dep"`, or `'dep'`.
-#[allow(dead_code)] // Phase 2: detectProjectTypeFlags
-fn python_dep_match(content: &str, dep: &str) -> bool {
-    let dq = format!("\"{dep}\"");
-    let sq = format!("'{dep}'");
-    if content.contains(&dq) || content.contains(&sq) {
-        return true;
-    }
-    content.lines().any(|line| {
-        let t = line.trim_start();
-        t.starts_with(dep) && t[dep.len()..].starts_with(['=', '<', '>', '~'])
+fn build_commands(p: &ProjectRaw, pm: &str) -> anyhow::Result<Commands> {
+    Ok(Commands {
+        lint: build_cmds(&p.lint, pm)?,
+        fmt: build_cmds(&p.fmt, pm)?,
+        build: build_cmds(&p.build, pm)?,
+        test: build_cmds(&p.test, pm)?,
+        install: build_cmds(&p.install, pm)?,
+        dev: build_cmds(&p.dev, pm)?,
     })
 }
 
-// ---- CEL config-driven detection ----
-
-/// A `repo.toml` `[[detect]]` rule with its CEL expression compiled once at
-/// load. Evaluation against a project snapshot is cheap and repeated.
-pub struct CompiledRule {
-    pub id: String,
-    pub name: String,
-    program: Program,
+fn build_cmds(raws: &[CommandRaw], pm: &str) -> anyhow::Result<Vec<CommandDef>> {
+    raws.iter().map(|r| build_cmd(r, pm)).collect()
 }
 
-impl CompiledRule {
-    fn eval_bool(&self, ctx: &Context) -> bool {
-        matches!(self.program.execute(ctx), Ok(Value::Bool(true)))
-    }
+fn build_cmd(raw: &CommandRaw, pm: &str) -> anyhow::Result<CommandDef> {
+    Ok(CommandDef {
+        name: raw.name.clone(),
+        cmd: sub_pm(&raw.cmd, pm),
+        when: raw
+            .when
+            .as_ref()
+            .map(|s| compile_cel(s, &raw.name).map(Arc::new))
+            .transpose()?,
+        fix_cmd: raw.fix.as_ref().map(|s| sub_pm(s, pm)),
+        check_cmd: raw.check.as_ref().map(|s| sub_pm(s, pm)),
+        cost: raw.cost,
+    })
 }
 
-#[derive(Deserialize)]
-struct DetectConfig {
-    #[serde(default)]
-    detect: Vec<DetectRaw>,
-}
-
-#[derive(Deserialize)]
-struct DetectRaw {
-    id: String,
-    #[serde(default)]
-    name: Option<String>,
-    expr: String,
-}
-
-/// Load and compile `repo.toml` `[[detect]]` rules. Returns empty when there is
-/// no `repo.toml`. Parse/compile errors fail loud with the offending rule id.
-fn load_rules(cwd: &Path) -> anyhow::Result<Vec<CompiledRule>> {
-    let path = cwd.join("repo.toml");
-    let Ok(content) = fs::read_to_string(&path) else {
-        return Ok(Vec::new());
-    };
-    let cfg: DetectConfig =
-        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
-    cfg.detect
-        .into_iter()
-        .map(|r| {
-            let program = Program::compile(&r.expr)
-                .map_err(|e| anyhow::anyhow!("repo.toml detect[{}]: {}", r.id, e))?;
-            Ok(CompiledRule {
-                name: r.name.unwrap_or_else(|| r.id.clone()),
-                id: r.id,
-                program,
-            })
-        })
+/// Replace `{pm}` then split on whitespace into argv.
+fn sub_pm(s: &str, pm: &str) -> Vec<String> {
+    s.replace("{pm}", pm)
+        .split_whitespace()
+        .map(String::from)
         .collect()
 }
 
-/// Build a CEL evaluation context over the project snapshot. Host functions:
-/// `file(name)` — entry exists at root; `has_ext(dir, ext)` — `dir` holds a file
-/// ending in `ext`; `contains(file, needle)` — `file` exists and contains
-/// `needle`. Closures capture owned `Arc` snapshots so the context is `'static`.
-fn cel_context(cwd: &Path, entries: &HashSet<String>) -> Context<'static> {
-    let files = Arc::new(entries.clone());
-    let root = Arc::new(cwd.to_path_buf());
+// ============ CEL helpers ============
+
+fn compile_cel(expr: &str, label: &str) -> anyhow::Result<Program> {
+    Program::compile(expr).map_err(|e| anyhow::anyhow!("CEL error in '{label}': {e}"))
+}
+
+fn eval_bool(prog: &Program, ctx: &Context) -> bool {
+    matches!(prog.execute(ctx), Ok(Value::Bool(true)))
+}
+
+fn validate_bool(prog: &Program, ctx: &Context, label: &str) -> anyhow::Result<()> {
+    match prog.execute(ctx) {
+        Ok(Value::Bool(_)) => Ok(()),
+        Ok(v) => anyhow::bail!("CEL '{label}' must evaluate to bool, got {v:?}"),
+        Err(e) => anyhow::bail!("CEL '{label}': {e}"),
+    }
+}
+
+/// Build a CEL evaluation context.
+/// CWD was set to the project root by `Detector::new`, so all paths are relative.
+fn cel_context(pkg: &Option<serde_json::Value>) -> Context<'static> {
+    let pkg = Arc::new(pkg.clone());
     let mut ctx = Context::default();
-    let f = files.clone();
-    ctx.add_function("file", move |name: Arc<String>| -> bool {
-        f.contains(name.as_str())
+
+    // repo_root — available to expressions that need it, but not required.
+    if let Ok(dir) = std::env::current_dir() {
+        let _ = ctx.add_variable("repo_root", dir.to_string_lossy().into_owned());
+    }
+
+    // glob(pattern) — true if any file matches.
+    ctx.add_function("glob", move |pattern: Arc<String>| -> bool {
+        let p = pattern.as_str();
+        if !p.contains('*') && !p.contains('?') && !p.contains('[') {
+            return Path::new(p).exists();
+        }
+        glob::glob(p).is_ok_and(|mut it| it.next().is_some())
     });
-    let (f2, root2) = (files.clone(), root.clone());
+
+    // contains(file, needle) — file content includes needle.
     ctx.add_function(
         "contains",
         move |name: Arc<String>, needle: Arc<String>| -> bool {
-            f2.contains(name.as_str())
-                && fs::read_to_string(root2.join(name.as_str()))
-                    .is_ok_and(|c| c.contains(needle.as_str()))
+            fs::read_to_string(name.as_str()).is_ok_and(|c| c.contains(needle.as_str()))
         },
     );
-    let root3 = root.clone();
-    ctx.add_function(
-        "has_ext",
-        move |dir: Arc<String>, ext: Arc<String>| -> bool {
-            dir_has_ext(&root3.join(dir.as_str()), ext.as_str())
-        },
-    );
+
+    // script(name) — package.json defines a script named `name`.
+    ctx.add_function("script", move |name: Arc<String>| -> bool {
+        pkg.as_ref()
+            .as_ref()
+            .and_then(|v| v.get("scripts"))
+            .and_then(|s| s.get(name.as_str()))
+            .is_some()
+    });
+
+    // bin(name) — binary is on PATH.
+    ctx.add_function("bin", move |name: Arc<String>| -> bool {
+        which::which(name.as_str()).is_ok()
+    });
+
     ctx
 }
 
-fn dir_has_ext(dir: &Path, ext: &str) -> bool {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return false;
-    };
-    rd.flatten()
-        .any(|e| e.file_name().to_string_lossy().ends_with(ext))
-}
+// ============ tests ============
 
 #[cfg(test)]
 mod tests {
@@ -878,30 +518,92 @@ mod tests {
 
     #[test]
     fn cel_host_functions() {
-        let dir = cwd();
-        let entries = scan_entries(&dir);
-        let ctx = cel_context(&dir, &entries);
+        let root = find_root(&cwd());
+        let _ = std::env::set_current_dir(&root);
+        let pkg = read_json("package.json");
+        let ctx = cel_context(&pkg);
         let eval = |src: &str| -> bool {
             matches!(
                 Program::compile(src).unwrap().execute(&ctx),
                 Ok(Value::Bool(true))
             )
         };
-        assert!(eval("file('Cargo.toml')"));
-        assert!(!eval("file('nope.xyz')"));
-        assert!(eval("file('Cargo.toml') && !file('package.json')"));
-        assert!(eval("file('Cargo.toml') || file('nope.xyz')"));
-        assert!(eval("has_ext('src', '.rs')"));
-        assert!(!eval("has_ext('src', '.py')"));
+        assert!(eval("glob('Cargo.toml')"));
+        assert!(!eval("glob('nope.xyz')"));
+        assert!(eval("glob('src/**/*.rs')"));
+        assert!(eval("glob('*.toml')"));
+        assert!(!eval("glob('*.py')"));
         assert!(eval("contains('Cargo.toml', '[package]')"));
         assert!(!eval("contains('Cargo.toml', 'zz-not-present')"));
     }
 
     #[test]
-    fn load_rules_without_config_is_empty() {
-        if cwd().join("repo.toml").exists() {
-            return; // a local config would change this; skip then
-        }
-        assert!(load_rules(&cwd()).unwrap().is_empty());
+    fn repo_root_available() {
+        let root = find_root(&cwd());
+        let _ = std::env::set_current_dir(&root);
+        let ctx = cel_context(&None);
+        let val = Program::compile("repo_root")
+            .unwrap()
+            .execute(&ctx)
+            .unwrap();
+        assert!(matches!(val, Value::String(ref s) if s.contains("src/repo")));
+    }
+
+    #[test]
+    fn find_root_from_subdir() {
+        let root = find_root(&cwd());
+        let subdir = root.join("src/commands");
+        let found = find_root(&subdir);
+        assert_eq!(found, root, "should walk up to .git boundary");
+    }
+
+    #[test]
+    fn defaults_load_and_detect_rust() {
+        let d = Detector::new(cwd()).unwrap();
+        let ids: Vec<&str> = d
+            .detect_project_types()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert!(ids.contains(&"rust"), "rust should be detected: {ids:?}");
+    }
+
+    #[test]
+    fn sub_pm_splits_and_substitutes() {
+        assert_eq!(sub_pm("cargo build", "npm"), vec!["cargo", "build"]);
+        assert_eq!(sub_pm("{pm} test", "pnpm"), vec!["pnpm", "test"]);
+        assert_eq!(
+            sub_pm("{pm} run build", "yarn"),
+            vec!["yarn", "run", "build"]
+        );
+    }
+
+    #[test]
+    fn merge_extends_and_overrides() {
+        let base = parse_yaml(DEFAULTS, "test").unwrap();
+        let over = parse_yaml(
+            r#"
+projects:
+  rust:
+    lint:
+      - name: Custom Linter
+        cmd: my-linter .
+      - name: Clippy
+        cmd: cargo clippy --quiet
+"#,
+            "test",
+        )
+        .unwrap();
+        let merged = merge_pair(base, over);
+        let rust = merged.projects.get("rust").unwrap();
+        // New command appended
+        assert!(rust.lint.iter().any(|c| c.name == "Custom Linter"));
+        // Existing command overridden by name, not duplicated
+        let clippy = rust.lint.iter().find(|c| c.name == "Clippy").unwrap();
+        assert_eq!(clippy.cmd, "cargo clippy --quiet");
+        assert_eq!(rust.lint.iter().filter(|c| c.name == "Clippy").count(), 1);
+        // Other commands survive
+        assert!(rust.lint.iter().any(|c| c.name == "Format Check"));
+        assert!(!rust.fmt.is_empty(), "fmt should survive");
     }
 }

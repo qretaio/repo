@@ -1,0 +1,301 @@
+# Default detection rules and commands for `repo`.
+# Embedded via include_str!. Override with ~/.config/repo/repo.yaml (global)
+# or ./repo.yaml (local). Projects merge by id; command lists merge by name
+# (replace existing, append new) — extend with minimal config.
+#
+# CEL host functions available in detect/when expressions:
+#   repo_root             — absolute path to the project root
+#   glob(pattern)         — any file matches the glob (e.g. 'src/**/*.rs',
+#                          '.eslintrc*', 'scripts/*.sh')
+#   contains(file, str)   — file content includes str
+#   script(name)          — package.json defines a script named `name`
+#   bin(name)             — binary is on PATH
+#   project(id)           — project type `id` was detected (for when only)
+#
+# cost: 0 (default) = always runs. Higher values need --cost N to run.
+# {pm} in cmd/fix/check strings is replaced with the detected Node package
+# manager (npm/pnpm/yarn/bun, defaults to npm).
+
+_common:
+  eslint: &eslint "glob('.eslintrc*') || glob('eslint.config.*')"
+  prettier: &prettier "glob('.prettierrc*') || glob('prettier.config.*')"
+  typescript: &typescript "glob('tsconfig*.json')"
+  ruff: &ruff "glob('pyproject.toml') || glob('.ruff.toml') || glob('ruff.toml')"
+
+projects:
+  rust:
+    name: Rust
+    detect: "glob('Cargo.toml')"
+    lint:
+      - name: Clippy
+        cmd: cargo clippy --all-targets -- -D warnings
+      - name: Security Audit
+        cmd: cargo audit
+        when: "glob('Cargo.lock')"
+        cost: 10
+      - name: Format Check
+        cmd: cargo fmt -- --check
+        fix: cargo fmt
+    fmt:
+      - name: Format
+        cmd: cargo fmt
+        check: cargo fmt -- --check
+    build:
+      - name: Build
+        cmd: cargo build
+        cost: 10
+      - name: Check (faster)
+        cmd: cargo check
+    test:
+      - name: Tests
+        cmd: cargo test
+        cost: 10
+    install:
+      - name: Install
+        cmd: cargo install --path .
+        cost: 10
+    dev:
+      - name: Watch
+        cmd: cargo watch -x clippy
+        when: "bin('cargo-watch')"
+      - name: Run
+        cmd: cargo clippy
+        when: "!bin('cargo-watch')"
+
+  go:
+    name: Go
+    detect: "glob('go.mod')"
+    lint:
+      - name: Vet
+        cmd: go vet ./...
+      - name: Security Audit
+        cmd: "go run golang.org/x/vuln/cmd/govulncheck@latest ./..."
+        when: "glob('go.mod')"
+        cost: 10
+      - name: golangci-lint
+        cmd: golangci-lint run
+        when: "glob('.golangci.*')"
+        cost: 10
+      - name: Staticcheck
+        cmd: "go run honnef.co/go/tools/cmd/staticcheck@latest ./..."
+        when: "glob('go.mod')"
+    fmt:
+      - name: Format
+        cmd: gofmt -w .
+        check: gofmt -l .
+    build:
+      - name: Build
+        cmd: go build ./...
+        cost: 10
+    test:
+      - name: Tests
+        cmd: go test ./...
+        cost: 10
+    install:
+      - name: Install
+        cmd: go install ./...
+        cost: 10
+    dev:
+      - name: Air
+        cmd: air
+        when: "bin('air')"
+      - name: Run
+        cmd: go run .
+        when: "!bin('air')"
+
+  nodejs:
+    name: Node.js
+    detect: "glob('package.json')"
+    lint:
+      - name: ESLint
+        cmd: npx eslint .
+        fix: npx eslint --fix .
+        when: *eslint
+      - name: Type Check
+        cmd: npx tsc --noEmit
+        when: *typescript
+      - name: Format Check
+        cmd: npx prettier --check .
+        fix: npx prettier --write .
+        when: *prettier
+      - name: Security Audit
+        cmd: "{pm} audit"
+        when: "glob('package.json')"
+        cost: 10
+    fmt:
+      - name: Prettier
+        cmd: npx prettier --log-level warn --write .
+        check: npx prettier --log-level warn --check .
+        when: *prettier
+      - name: ESLint --fix
+        cmd: npx eslint --fix .
+        when: *eslint
+    build:
+      - name: Build
+        cmd: "{pm} run build"
+        when: "script('build')"
+        cost: 10
+      - name: TypeScript
+        cmd: npx -y tsc --noEmit
+        when: *typescript
+    test:
+      - name: Tests
+        cmd: "{pm} test"
+        when: "script('test')"
+        cost: 10
+    dev:
+      - name: Dev Server
+        cmd: "{pm} run dev"
+        when: "script('dev')"
+
+  python:
+    name: Python
+    detect: "glob('pyproject.toml') || glob('requirements.txt') || glob('.python-version') || glob('setup.py')"
+    lint:
+      - name: Ruff
+        cmd: uv run ruff check .
+        fix: uv run ruff check --fix .
+        when: *ruff
+      - name: Mypy
+        cmd: uv run mypy .
+        when: >
+          glob('mypy.ini') || glob('.mypy.ini')
+          || (glob('pyproject.toml') && contains('pyproject.toml', '[tool.mypy]'))
+      - name: Format Check
+        cmd: uv run ruff format --check .
+        fix: uv run ruff format .
+        when: *ruff
+      - name: Pylint
+        cmd: uv run pylint .
+        when: "glob('pylintrc') || glob('.pylintrc')"
+        cost: 10
+      - name: Security Audit
+        cmd: uv run pip-audit
+        when: "glob('pyproject.toml') || glob('requirements.txt')"
+        cost: 10
+    fmt:
+      - name: Ruff format
+        cmd: uv run ruff format .
+        check: uv run ruff format --check .
+        when: *ruff
+      - name: Black
+        cmd: uv run black .
+        check: uv run black --check .
+        when: "glob('pyproject.toml')"
+    build:
+      - name: Build
+        cmd: uv build .
+        when: "glob('pyproject.toml')"
+        cost: 10
+    test:
+      - name: Pytest
+        cmd: uv run pytest -q
+        when: "glob('pyproject.toml') || glob('pytest.ini') || glob('setup.cfg')"
+        cost: 10
+
+  jvm:
+    name: Java/Kotlin
+    detect: "glob('build.gradle*') || glob('pom.xml') || glob('settings.gradle')"
+    lint:
+      - name: Checkstyle
+        cmd: ./gradlew checkstyleMain
+        when: "glob('build.gradle*')"
+      - name: Detekt
+        cmd: ./gradlew detekt
+        when: "glob('detekt.yml') || glob('.detekt.yml')"
+      - name: Format Check
+        cmd: ./gradlew spotlessCheck
+        fix: ./gradlew spotlessApply
+        when: >
+          glob('build.gradle*')
+          && (contains('build.gradle', 'spotless') || contains('build.gradle.kts', 'spotless'))
+    fmt:
+      - name: Spotless apply
+        cmd: ./gradlew spotlessApply
+        check: ./gradlew spotlessCheck
+        when: "glob('build.gradle*')"
+    build:
+      - name: Build
+        cmd: mvn compile
+        when: "glob('pom.xml')"
+        cost: 10
+      - name: Build (Gradle)
+        cmd: ./gradlew build
+        when: "!glob('pom.xml')"
+        cost: 10
+    test:
+      - name: Tests
+        cmd: mvn test
+        when: "glob('pom.xml')"
+        cost: 10
+      - name: Tests (Gradle)
+        cmd: ./gradlew test
+        when: "!glob('pom.xml')"
+        cost: 10
+    install:
+      - name: Install
+        cmd: mvn install
+        when: "glob('pom.xml')"
+        cost: 10
+    dev:
+      - name: Run
+        cmd: mvn spring-boot:run
+        when: "glob('pom.xml')"
+      - name: Run
+        cmd: ./gradlew bootRun
+        when: "!glob('pom.xml')"
+
+# --- universal commands (top-level, apply to all projects) ---
+lint:
+  - name: Semgrep
+    cmd: npx -y semgrep scan --config auto
+    cost: 10
+  - name: Knip
+    cmd: npx knip
+    when: >
+      glob('knip.*')
+      || (glob('package.json') && contains('package.json', '"knip"'))
+    cost: 10
+  - name: Secrets (Gitleaks)
+    cmd: gitleaks detect --verbose --redact --no-git
+    when: "bin('gitleaks')"
+    cost: 10
+  - name: Security (Trivy)
+    cmd: "trivy fs . --severity HIGH,CRITICAL"
+    when: "bin('trivy')"
+    cost: 10
+  - name: Secrets (Trufflehog)
+    cmd: trufflehog filesystem . --only-verified
+    when: "bin('trufflehog')"
+    cost: 10
+  - name: DESIGN.md
+    cmd: "npx -y @google/design.md lint DESIGN.md"
+    when: "glob('DESIGN.md')"
+  - name: Shell
+    cmd: npx -y shellcheck scripts/*.sh bin/*.sh
+    when: "glob('scripts/*.sh') || glob('bin/*.sh')"
+  - name: Markdown
+    cmd: "npx -y markdownlint-cli2 **/*.md #node_modules"
+    when: "glob('.markdownlint*')"
+  - name: Format Check
+    cmd: npx prettier --check .
+    fix: npx prettier --write .
+    when: >
+      (glob('.prettierrc*') || glob('prettier.config.*'))
+      && !project('nodejs')
+
+fmt:
+  - name: Prettier
+    cmd: npx prettier --log-level warn --write .
+    check: npx prettier --log-level warn --check .
+    when: *prettier
+  - name: Dprint
+    cmd: npx -y dprint fmt
+    check: npx -y dprint check
+    when: "glob('dprint.*')"
+
+test:
+  - name: Tests
+    cmd: "{pm} test"
+    when: "script('test') && !project('nodejs')"
+    cost: 10

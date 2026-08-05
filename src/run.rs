@@ -20,6 +20,7 @@ pub struct RunOptions {
 pub struct Task {
     pub name: String,
     pub cmd: Vec<String>,
+    pub cost: u32,
 }
 
 impl Task {
@@ -27,6 +28,7 @@ impl Task {
         Self {
             name: name.into(),
             cmd: cmd.to_vec(),
+            cost: 0,
         }
     }
 }
@@ -99,8 +101,9 @@ pub fn run_command(task: &Task, opts: &RunOptions) -> RunResult {
     if let Some(dir) = &opts.cwd {
         expr = expr.dir(dir);
     }
-    // verbose: inherit stdio (live output). Otherwise capture for error display.
-    let expr = if opts.verbose {
+    // Expensive commands (cost ≥ 10) stream live; cheap ones capture unless --verbose.
+    let stream = opts.verbose || task.cost >= 10;
+    let expr = if stream {
         expr
     } else {
         expr.stdout_capture().stderr_capture()
