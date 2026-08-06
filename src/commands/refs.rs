@@ -36,21 +36,21 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
         }
     };
 
-    // Auto-build the store on first use; warn (don't block) when stale.
-    let store_exists = symbols::db::db_path(&root)
-        .map(|p| p.exists())
-        .unwrap_or(false);
-    if !store_exists {
-        eprintln!("{}", "No symbol store yet — building…".cyan());
-        if let Err(e) = symbols::build(&root, true) {
+    // Ensure the store is current before querying. `build` is a no-op when the
+    // store is fresh; otherwise (missing, schema-bumped/empty, or source
+    // changed) it rebuilds — so refs never silently serve stale/empty data.
+    match symbols::build(&root, false) {
+        Ok(stats) if stats.rebuilt => {
+            eprintln!(
+                "{}",
+                format!("Indexed {} symbols in {} files.", stats.defs, stats.files).cyan()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
             eprintln!("{}", format!("Error: {e}").red());
             return 1;
         }
-    } else if symbols::is_stale(&root) {
-        eprintln!(
-            "{}",
-            "Symbol store is stale — run `repo symbols` to refresh.".yellow()
-        );
     }
 
     // No symbol (or blank) → list the symbols available for lookup.
@@ -238,16 +238,7 @@ fn list_symbols(root: &std::path::Path, json: bool) -> i32 {
         }
     };
 
-    // name -> (distinct kinds, site count)
-    let mut groups: std::collections::BTreeMap<&str, (std::collections::BTreeSet<&str>, usize)> =
-        std::collections::BTreeMap::new();
-    for d in &all {
-        let g = groups.entry(d.name.as_str()).or_default();
-        g.0.insert(d.kind.label());
-        g.1 += 1;
-    }
-
-    if groups.is_empty() {
+    if all.is_empty() {
         if !json {
             eprintln!("{}", "No symbols indexed — is the store built?".yellow());
         }
@@ -255,6 +246,16 @@ fn list_symbols(root: &std::path::Path, json: bool) -> i32 {
     }
 
     if json {
+        // name -> (distinct kinds, site count)
+        let mut groups: std::collections::BTreeMap<
+            &str,
+            (std::collections::BTreeSet<&str>, usize),
+        > = std::collections::BTreeMap::new();
+        for d in &all {
+            let g = groups.entry(d.name.as_str()).or_default();
+            g.0.insert(d.kind.label());
+            g.1 += 1;
+        }
         let arr: Vec<_> = groups
             .iter()
             .map(|(name, (kinds, count))| {
@@ -269,29 +270,132 @@ fn list_symbols(root: &std::path::Path, json: bool) -> i32 {
         return 0;
     }
 
+    render_outline(&all);
+    0
+}
+
+/// Render a repo-wide hierarchical outline: every type expanded with its
+/// `impl` blocks and the methods within them, followed by free functions and
+/// methods of external types. The same breakdown `repo refs <symbol>` shows for
+/// one symbol, but for all of them.
+fn render_outline(all: &[Definition]) {
+    use std::collections::HashSet;
+
+    let is_type = |d: &&Definition| {
+        matches!(
+            d.kind,
+            DefKind::Struct | DefKind::Enum | DefKind::Trait | DefKind::Class | DefKind::Type
+        )
+    };
+    let type_names: HashSet<&str> = all
+        .iter()
+        .filter(|d| is_type(d))
+        .map(|d| d.name.as_str())
+        .collect();
+
+    let mut types: Vec<&Definition> = all.iter().filter(|d| is_type(d)).collect();
+    types.sort_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)));
+
+    let impls: Vec<&Definition> = all.iter().filter(|d| d.kind == DefKind::Impl).collect();
+    let belongs_to_type =
+        |m: &&Definition| m.parent.as_deref().is_some_and(|p| type_names.contains(p));
+    let type_methods: Vec<&Definition> = all
+        .iter()
+        .filter(|d| matches!(d.kind, DefKind::Function | DefKind::Method) && belongs_to_type(d))
+        .collect();
+    let mut free_fns: Vec<&Definition> = all
+        .iter()
+        .filter(|d| matches!(d.kind, DefKind::Function | DefKind::Method) && d.parent.is_none())
+        .collect();
+    let mut orphans: Vec<&Definition> = all
+        .iter()
+        .filter(|d| {
+            matches!(d.kind, DefKind::Function | DefKind::Method)
+                && d.parent.is_some()
+                && !belongs_to_type(d)
+        })
+        .collect();
+
     println!(
         "{}",
-        format!(
-            "Available symbols ({} unique, {} definitions):",
-            groups.len(),
-            all.len()
-        )
-        .bold()
+        format!("Symbol outline ({} definitions)", all.len()).bold()
     );
-    for (name, (kinds, count)) in &groups {
-        let keywords = kinds
+
+    for ty in &types {
+        println!(
+            "\n  {} {}  {}:{}",
+            ty.kind.keyword().bright_black(),
+            ty.name.bold(),
+            ty.file_path.cyan(),
+            ty.start_line
+        );
+        // Methods of this type, nested into its impl blocks by containment.
+        let mut pool: Vec<&Definition> = type_methods
             .iter()
-            .filter_map(|l| DefKind::from_label(l).map(|k| k.keyword()))
-            .collect::<Vec<_>>()
-            .join("/");
-        let tail = if *count > 1 {
-            format!(" ×{count}").bright_black().to_string()
-        } else {
-            String::new()
-        };
-        println!("  {} {}{}", keywords.bright_black(), name.bold(), tail);
+            .copied()
+            .filter(|m| m.parent.as_deref() == Some(ty.name.as_str()))
+            .collect();
+        for imp in impls.iter().filter(|i| i.name == ty.name) {
+            println!(
+                "    {} {}  {}:{}-{}",
+                "impl".bright_black(),
+                ty.name,
+                imp.file_path.cyan(),
+                imp.start_line,
+                imp.end_line
+            );
+            let mut i = 0;
+            while i < pool.len() {
+                let m = pool[i];
+                if m.file_path == imp.file_path
+                    && imp.start_line <= m.start_line
+                    && m.start_line <= imp.end_line
+                {
+                    println!("      {} ({})", decl_head(m), m.start_line);
+                    pool.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for m in pool {
+            println!(
+                "    {}  {}:{}",
+                decl_head(m),
+                m.file_path.cyan(),
+                m.start_line
+            );
+        }
     }
-    0
+
+    let by_loc = |a: &&Definition, b: &&Definition| {
+        (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line))
+    };
+    free_fns.sort_by(by_loc);
+    if !free_fns.is_empty() {
+        println!("\n  {}", "free functions".bright_black());
+        for f in free_fns {
+            println!(
+                "    {}  {}:{}",
+                decl_head(f),
+                f.file_path.cyan(),
+                f.start_line
+            );
+        }
+    }
+    orphans.sort_by(by_loc);
+    if !orphans.is_empty() {
+        println!("\n  {}", "methods on external types".bright_black());
+        for m in orphans {
+            println!(
+                "    {}  {}:{}  (in {})",
+                decl_head(m),
+                m.file_path.cyan(),
+                m.start_line,
+                m.parent.as_deref().unwrap_or("?")
+            );
+        }
+    }
 }
 
 fn def_json(d: &Definition) -> serde_json::Value {
