@@ -8,4 +8,5 @@ pub mod install;
 pub mod lint;
 pub mod mix;
 pub mod run;
+pub mod search;
 pub mod test;

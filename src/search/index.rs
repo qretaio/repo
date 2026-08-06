@@ -14,13 +14,27 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tantivy::schema::{Schema, STORED, TEXT};
-use tantivy::{doc, Index};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{Schema, Value, STORED, TEXT};
+use tantivy::{doc, Index, TantivyDocument};
 
 use super::chunker::chunks;
 use super::tokenizer::expand;
 
 const SCHEMA_VERSION: u32 = 1;
+
+/// One ranked search hit.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub path: String,
+    pub start: u64,
+    pub end: u64,
+    pub lang: String,
+    /// Tantivy BM25 score (only comparable within one query).
+    pub score: f32,
+    pub source: String,
+}
 
 /// Outcome of an index build.
 #[derive(Debug, Clone)]
@@ -170,6 +184,91 @@ pub fn build(root: &Path, force: bool) -> Result<BuildStats> {
     })
 }
 
+/// Run a ranked BM25 search against `root`'s index. The index must already
+/// exist (call [`build`] first, or rely on the command layer to do so).
+pub fn search(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    lang: Option<&str>,
+    path_filter: Option<&str>,
+) -> Result<Vec<Hit>> {
+    let dir = index_dir(root).context("no cache dir available")?;
+    if !dir.join("meta.json").exists() {
+        anyhow::bail!("no index found — run `repo index` first");
+    }
+    let index = Index::open_in_dir(&dir)?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+
+    let (_, fields) = make_schema_for(&index.schema());
+    let qp = QueryParser::for_index(&index, vec![fields.tokens]);
+    let query_obj = match qp.parse_query(query) {
+        Ok(q) => q,
+        Err(_) => {
+            // Special chars in the query (parens, colons, …) confuse the parser.
+            // Fall back to a phrase query of the raw text.
+            qp.parse_query(&format!("\"{}\"", query.escape_default()))?
+        }
+    };
+
+    // Over-fetch so post-filters (lang / path substring) can still fill `limit`.
+    let fetch = (limit * 5).max(limit + 10);
+    let top: Vec<(tantivy::Score, tantivy::DocAddress)> =
+        searcher.search(&query_obj, &TopDocs::with_limit(fetch).order_by_score())?;
+
+    let mut hits = Vec::with_capacity(limit);
+    for (score, addr) in top {
+        if hits.len() >= limit {
+            break;
+        }
+        let d: TantivyDocument = searcher.doc(addr)?;
+        let path = d
+            .get_first(fields.path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let lang_val = d
+            .get_first(fields.lang)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let start = d
+            .get_first(fields.start)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let end = d
+            .get_first(fields.end)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let source = d
+            .get_first(fields.source)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if let Some(want) = lang {
+            if !lang_val.eq_ignore_ascii_case(want) {
+                continue;
+            }
+        }
+        if let Some(needle) = path_filter {
+            if !path.contains(needle) {
+                continue;
+            }
+        }
+        hits.push(Hit {
+            path,
+            start,
+            end,
+            lang: lang_val,
+            score,
+            source,
+        });
+    }
+    Ok(hits)
+}
+
 // ---------------------------------------------------------------------------
 // schema
 // ---------------------------------------------------------------------------
@@ -194,6 +293,23 @@ fn make_schema() -> (Schema, Fields) {
         tokens: b.add_text_field("tokens", TEXT),
     };
     (b.build(), f)
+}
+
+/// Reconstruct field handles from an existing schema (used at search time when
+/// we open an index rather than create one).
+fn make_schema_for(schema: &Schema) -> ((), Fields) {
+    let get = |name: &str| schema.get_field(name).expect("schema missing field");
+    (
+        (),
+        Fields {
+            path: get("path"),
+            start: get("start"),
+            end: get("end"),
+            lang: get("lang"),
+            source: get("source"),
+            tokens: get("tokens"),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +473,59 @@ mod tests {
         let b = fnv1a64("/Users/foo/src/repo");
         assert_eq!(a, b);
         assert_ne!(a, fnv1a64("/Users/foo/src/other"));
+    }
+
+    /// End-to-end: build an index in a temp dir and search it. Verifies the
+    /// whole schema/writer/reader path works on this Tantivy version.
+    #[test]
+    fn build_and_search_roundtrip() {
+        let tmp = tempfile_dir();
+        let src = "#![allow(dead_code)]\n\
+                   pub fn handle_login(user: &str) -> bool {\n\
+                       let auth = authenticate(user);\n\
+                       auth\n\
+                   }\n\
+                   pub fn authenticate(token: &str) -> bool {\n\
+                       token.len() > 3\n\
+                   }\n";
+        fs::write(tmp.join("auth.rs"), src).unwrap();
+
+        let stats = build(&tmp, true).expect("build");
+        assert!(stats.rebuilt);
+        assert_eq!(stats.files, 1);
+        assert!(
+            stats.chunks >= 1,
+            "expected at least one chunk, got {}",
+            stats.chunks
+        );
+
+        // Not stale immediately after build.
+        assert!(!is_stale(&tmp));
+
+        // "login" should rank the handle_login chunk highest.
+        let hits = search(&tmp, "login", 5, None, None).expect("search");
+        assert!(!hits.is_empty(), "expected hits for 'login'");
+        assert!(
+            hits[0].source.contains("handle_login"),
+            "top hit was: {}",
+            hits[0].source
+        );
+
+        // camelCase expansion: "auth" should also hit authenticate.
+        let hits = search(&tmp, "authenticate", 5, None, None).expect("search2");
+        assert!(hits.iter().any(|h| h.source.contains("authenticate")));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("repo-search-test-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// Silence unused-import noise if constants get optimized out in tests.

@@ -12,7 +12,8 @@ mod search;
 
 use commands::{
     build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, index::IndexArgs,
-    install::InstallArgs, lint::LintArgs, mix::MixArgs, run::RunArgs, test::TestArgs,
+    install::InstallArgs, lint::LintArgs, mix::MixArgs, run::RunArgs, search::SearchArgs,
+    test::TestArgs,
 };
 use detect::Detector;
 
@@ -128,6 +129,13 @@ enum Cmd {
     /// scratch. Required once before `repo search` (which also auto-builds on
     /// first use).
     Index(IndexArgs),
+
+    /// Ranked full-text code search (BM25).
+    ///
+    /// Searches the repository index for function names, API calls, error
+    /// messages, etc. Results are ranked by relevance and filtered with
+    /// `--lang` / `--path`. Builds the index automatically on first use.
+    Search(SearchArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -159,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Mix(a) => commands::mix::run(&a),
         Cmd::Context(a) => commands::context::run(&detector, &globals, &a),
         Cmd::Index(a) => commands::index::run(&detector, &globals, &a),
+        Cmd::Search(a) => commands::search::run(&detector, &globals, &a),
     };
 
     process::exit(code);
