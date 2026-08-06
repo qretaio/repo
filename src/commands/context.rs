@@ -55,9 +55,13 @@ pub struct ContextArgs {
     #[arg(long = "no-tests")]
     pub no_tests: bool,
 
-    /// Exclude import dependency graph
+    /// Include import dependency graph
     #[arg(long = "no-graph")]
     pub no_graph: bool,
+
+    /// Include a tree-sitter symbol map (definitions outline)
+    #[arg(long)]
+    pub symbols: bool,
 
     /// Exclude project metadata
     #[arg(long = "no-metadata")]
@@ -137,6 +141,7 @@ fn compute(d: &Detector, base: &std::path::Path, args: &ContextArgs) -> anyhow::
         graph: !args.no_graph,
         metadata: !args.no_metadata,
         patterns: true,
+        symbols: args.symbols || args.full,
     };
 
     let mut out = context::gather(d, base, &opts)?;

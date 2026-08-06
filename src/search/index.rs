@@ -326,6 +326,23 @@ pub(crate) fn list_source_files(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Same as [`list_source_files`] but retains each file's mtime, for staleness
+/// checks. Shared with the symbol store.
+pub(crate) fn source_files(root: &Path) -> Vec<(String, u64)> {
+    collect_files(root).unwrap_or_default()
+}
+
+/// FNV-1a 64-bit — deterministic, no random seed (unlike `DefaultHasher`).
+/// Shared with the symbol store for cache-dir keying.
+pub(crate) fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// Map a source extension to a language label, or `None` for non-code files.
 pub(crate) fn lang_for(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -445,16 +462,6 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// FNV-1a 64-bit — deterministic, no random seed (unlike `DefaultHasher`).
-fn fnv1a64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 #[cfg(test)]

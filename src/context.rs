@@ -25,6 +25,7 @@ pub struct ContextOptions {
     pub graph: bool,
     pub metadata: bool,
     pub patterns: bool,
+    pub symbols: bool,
 }
 
 impl Default for ContextOptions {
@@ -39,6 +40,7 @@ impl Default for ContextOptions {
             graph: true,
             metadata: true,
             patterns: true,
+            symbols: false,
         }
     }
 }
@@ -1028,6 +1030,60 @@ fn gather_import_graph(base: &Path, flags: Flags) -> String {
     lines.join("\n")
 }
 
+/// Build a ctags-style outline of definitions across supported source files,
+/// grouped by file. On-demand parse (no symbol-store dependency), so `ctx`
+/// stays index-free. Caps total definitions to keep the output bounded.
+fn gather_symbols(base: &Path) -> String {
+    use crate::symbols::{lang::language_for_path, parse::parse_definitions};
+    use std::collections::BTreeMap;
+
+    let mut by_file: BTreeMap<String, Vec<crate::symbols::Definition>> = BTreeMap::new();
+    let mut total = 0usize;
+    const CAP: usize = 400;
+
+    for rel in crate::search::index::list_source_files(base) {
+        if language_for_path(std::path::Path::new(&rel)).is_none() {
+            continue;
+        }
+        let Some(content) = read_rel(base, &rel) else {
+            continue;
+        };
+        let mut defs = parse_definitions(&content, &rel);
+        defs.sort_by_key(|d| d.start_line);
+        total += defs.len();
+        by_file.insert(rel, defs);
+        if total >= CAP {
+            break;
+        }
+    }
+
+    if by_file.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec!["## Symbol Map".to_string()];
+    let mut shown = 0usize;
+    for (file, defs) in &by_file {
+        lines.push(format!("\n{file}:"));
+        for d in defs {
+            if shown >= CAP {
+                lines.push("  … (truncated)".to_string());
+                lines.push(String::new());
+                return lines.join("\n");
+            }
+            lines.push(format!(
+                "  {} {} ({})",
+                d.kind.label(),
+                d.name,
+                d.start_line
+            ));
+            shown += 1;
+        }
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 // ============ todos (rg) ============
 
 fn gather_todos(base: &Path) -> Vec<String> {
@@ -1296,54 +1352,68 @@ pub fn gather(detector: &Detector, base: &Path, opts: &ContextOptions) -> anyhow
     // it up front so the parallel gatherers only touch `base` / `flags`.
     let intel = gather_intelligence(detector);
 
-    let (git, metadata, rules, readme, stats, analysis, audit, graph, tests, todos, listing) =
-        std::thread::scope(|s| {
-            let h_git = s.spawn(|| gather_git(base));
-            let h_meta = if opts.metadata {
-                Some(s.spawn(|| gather_metadata(base, flags)))
-            } else {
-                None
-            };
-            let h_rules = if opts.metadata {
-                Some(s.spawn(|| gather_code_rules(base)))
-            } else {
-                None
-            };
-            let h_readme = if opts.docs {
-                Some(s.spawn(|| gather_readme(base)))
-            } else {
-                None
-            };
-            let h_stats = opts.stats.then(|| s.spawn(|| gather_stats(base)));
-            let h_analysis = opts.analysis.then(|| s.spawn(|| gather_analysis(base)));
-            let h_audit = opts.audit.then(|| s.spawn(|| gather_audit(base, flags)));
-            let h_graph = if opts.graph {
-                Some(s.spawn(|| gather_import_graph(base, flags)))
-            } else {
-                None
-            };
-            let h_tests = opts.tests.then(|| s.spawn(|| gather_test_patterns(base)));
-            let h_todos = if opts.todos {
-                Some(s.spawn(|| gather_todos(base)))
-            } else {
-                None
-            };
-            let h_listing = s.spawn(|| gather_file_listing(base, 3));
+    let (
+        git,
+        metadata,
+        rules,
+        readme,
+        stats,
+        analysis,
+        audit,
+        graph,
+        tests,
+        todos,
+        listing,
+        symbols,
+    ) = std::thread::scope(|s| {
+        let h_git = s.spawn(|| gather_git(base));
+        let h_meta = if opts.metadata {
+            Some(s.spawn(|| gather_metadata(base, flags)))
+        } else {
+            None
+        };
+        let h_rules = if opts.metadata {
+            Some(s.spawn(|| gather_code_rules(base)))
+        } else {
+            None
+        };
+        let h_readme = if opts.docs {
+            Some(s.spawn(|| gather_readme(base)))
+        } else {
+            None
+        };
+        let h_stats = opts.stats.then(|| s.spawn(|| gather_stats(base)));
+        let h_analysis = opts.analysis.then(|| s.spawn(|| gather_analysis(base)));
+        let h_audit = opts.audit.then(|| s.spawn(|| gather_audit(base, flags)));
+        let h_graph = if opts.graph {
+            Some(s.spawn(|| gather_import_graph(base, flags)))
+        } else {
+            None
+        };
+        let h_tests = opts.tests.then(|| s.spawn(|| gather_test_patterns(base)));
+        let h_symbols = opts.symbols.then(|| s.spawn(|| gather_symbols(base)));
+        let h_todos = if opts.todos {
+            Some(s.spawn(|| gather_todos(base)))
+        } else {
+            None
+        };
+        let h_listing = s.spawn(|| gather_file_listing(base, 3));
 
-            (
-                h_git.join().ok().flatten(),
-                h_meta.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_rules.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_readme.and_then(|h| h.join().ok()).flatten(),
-                h_stats.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_analysis.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_audit.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_graph.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_tests.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_todos.and_then(|h| h.join().ok()).unwrap_or_default(),
-                h_listing.join().unwrap_or_default(),
-            )
-        });
+        (
+            h_git.join().ok().flatten(),
+            h_meta.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_rules.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_readme.and_then(|h| h.join().ok()).flatten(),
+            h_stats.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_analysis.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_audit.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_graph.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_tests.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_todos.and_then(|h| h.join().ok()).unwrap_or_default(),
+            h_listing.join().unwrap_or_default(),
+            h_symbols.and_then(|h| h.join().ok()).unwrap_or_default(),
+        )
+    });
 
     let (dirs, entry_points, test_count) = gather_structure(base);
 
@@ -1403,6 +1473,10 @@ pub fn gather(detector: &Detector, base: &Path, opts: &ContextOptions) -> anyhow
     }
     if !graph.is_empty() {
         lines.push(graph);
+        lines.push(String::new());
+    }
+    if !symbols.is_empty() {
+        lines.push(symbols);
         lines.push(String::new());
     }
     if !tests.is_empty() {

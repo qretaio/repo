@@ -9,11 +9,12 @@ mod context;
 mod detect;
 mod run;
 mod search;
+mod symbols;
 
 use commands::{
     build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, index::IndexArgs,
     install::InstallArgs, lint::LintArgs, mix::MixArgs, refs::RefsArgs, run::RunArgs,
-    search::SearchArgs, test::TestArgs,
+    search::SearchArgs, symbols::SymbolsArgs, test::TestArgs,
 };
 use detect::Detector;
 
@@ -139,10 +140,18 @@ enum Cmd {
 
     /// Find symbol definitions and references (exact match).
     ///
-    /// Reports where a function, struct, class, etc. is defined and used across
-    /// the repository. Index-independent regex scan; complements the ranked
-    /// `search` with exact whole-word matches.
+    /// Reports where a function, struct, class, etc. is defined, who imports
+    /// it, and where it is referenced. Backed by the tree-sitter symbol store
+    /// (`repo symbols`); auto-builds on first use.
     Refs(RefsArgs),
+
+    /// Build (or refresh) the tree-sitter symbol store.
+    ///
+    /// Parses supported source files (Rust, Python, Go, TypeScript, JavaScript)
+    /// into a SQLite cache of definitions and import edges under
+    /// `~/.cache/repo/symbols/`. Required once before `repo refs` (which also
+    /// auto-builds on first use).
+    Symbols(SymbolsArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -176,6 +185,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Index(a) => commands::index::run(&detector, &globals, &a),
         Cmd::Search(a) => commands::search::run(&detector, &globals, &a),
         Cmd::Refs(a) => commands::refs::run(&detector, &globals, &a),
+        Cmd::Symbols(a) => commands::symbols::run(&detector, &globals, &a),
     };
 
     process::exit(code);

@@ -10,4 +10,5 @@ pub mod mix;
 pub mod refs;
 pub mod run;
 pub mod search;
+pub mod symbols;
 pub mod test;
