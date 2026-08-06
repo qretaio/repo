@@ -8,10 +8,11 @@ mod commands;
 mod context;
 mod detect;
 mod run;
+mod search;
 
 use commands::{
-    build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, install::InstallArgs,
-    lint::LintArgs, mix::MixArgs, run::RunArgs, test::TestArgs,
+    build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, index::IndexArgs,
+    install::InstallArgs, lint::LintArgs, mix::MixArgs, run::RunArgs, test::TestArgs,
 };
 use detect::Detector;
 
@@ -119,6 +120,14 @@ enum Cmd {
     /// and vulnerability audits into a single AI-friendly document.
     #[command(alias = "ctx")]
     Context(ContextArgs),
+
+    /// Build (or refresh) the ranked search index for this repository.
+    ///
+    /// Indexes source files into a Tantivy BM25 index under
+    /// `~/.cache/repo/index/`. Incremental by mtime; `--force` rebuilds from
+    /// scratch. Required once before `repo search` (which also auto-builds on
+    /// first use).
+    Index(IndexArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -149,6 +158,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Run(a) => commands::run::run(&detector, &globals, &a),
         Cmd::Mix(a) => commands::mix::run(&a),
         Cmd::Context(a) => commands::context::run(&detector, &globals, &a),
+        Cmd::Index(a) => commands::index::run(&detector, &globals, &a),
     };
 
     process::exit(code);

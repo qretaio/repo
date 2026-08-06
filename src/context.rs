@@ -108,7 +108,7 @@ fn basename(base: &Path) -> String {
 }
 
 /// Run a command silently, returning (success, stdout). Never panics.
-fn capture(program: &str, args: &[&str], cwd: &Path) -> (bool, String) {
+pub(crate) fn capture(program: &str, args: &[&str], cwd: &Path) -> (bool, String) {
     match duct::cmd(program, args)
         .dir(cwd)
         .stdin_null()
