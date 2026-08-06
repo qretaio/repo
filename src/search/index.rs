@@ -316,6 +316,16 @@ fn make_schema_for(schema: &Schema) -> ((), Fields) {
 // file discovery + language mapping
 // ---------------------------------------------------------------------------
 
+/// List indexable source files (relative paths) under `root`. Shared with the
+/// `refs` command so symbol scanning uses the same inclusion rules as the index.
+pub(crate) fn list_source_files(root: &Path) -> Vec<String> {
+    collect_files(root)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect()
+}
+
 /// Map a source extension to a language label, or `None` for non-code files.
 pub(crate) fn lang_for(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();

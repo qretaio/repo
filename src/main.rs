@@ -12,8 +12,8 @@ mod search;
 
 use commands::{
     build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, index::IndexArgs,
-    install::InstallArgs, lint::LintArgs, mix::MixArgs, run::RunArgs, search::SearchArgs,
-    test::TestArgs,
+    install::InstallArgs, lint::LintArgs, mix::MixArgs, refs::RefsArgs, run::RunArgs,
+    search::SearchArgs, test::TestArgs,
 };
 use detect::Detector;
 
@@ -136,6 +136,13 @@ enum Cmd {
     /// messages, etc. Results are ranked by relevance and filtered with
     /// `--lang` / `--path`. Builds the index automatically on first use.
     Search(SearchArgs),
+
+    /// Find symbol definitions and references (exact match).
+    ///
+    /// Reports where a function, struct, class, etc. is defined and used across
+    /// the repository. Index-independent regex scan; complements the ranked
+    /// `search` with exact whole-word matches.
+    Refs(RefsArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -168,6 +175,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Context(a) => commands::context::run(&detector, &globals, &a),
         Cmd::Index(a) => commands::index::run(&detector, &globals, &a),
         Cmd::Search(a) => commands::search::run(&detector, &globals, &a),
+        Cmd::Refs(a) => commands::refs::run(&detector, &globals, &a),
     };
 
     process::exit(code);

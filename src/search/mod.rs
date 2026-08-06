@@ -10,4 +10,5 @@
 
 pub mod chunker;
 pub mod index;
+pub mod symbols;
 pub mod tokenizer;
