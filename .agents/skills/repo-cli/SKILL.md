@@ -19,10 +19,4 @@ repo — a command only runs when its own config is present.
   references (exact; skips comments/strings). No symbol → full repo outline.
 - **pack** — `mix`: forward args to `repomix`.
 
-**`repo help` is the source of truth** ; drill in
-with `repo help <cmd>` or `repo <cmd> --help`. Orientation: `--list` previews
-without running; `-v` streams live output; `--full` includes heavy checks; exit
-0 = pass, non-zero = fail.
-
-Detection is data-driven (embedded `defaults.yaml`); override globally via
-`~/.config/repo/repo.yaml` or locally via `./repo.yaml`.
+**`repo help` is the source of truth** ;
