@@ -312,7 +312,7 @@ fn detect_package_manager() -> Option<&'static str> {
     }
 }
 
-const DEFAULTS: &str = include_str!("defaults.yaml");
+pub(crate) const DEFAULTS: &str = include_str!("defaults.yaml");
 
 #[derive(Deserialize, Default)]
 struct RepoConfig {

@@ -328,7 +328,7 @@ lint:
     cmd: "npx -y @google/design.md lint DESIGN.md"
     when: "glob('DESIGN.md')"
   - name: Shell
-    cmd: npx -y shellcheck scripts/*.sh bin/*.sh
+    cmd: find . ( -path ./scripts/*.sh -o -path ./bin/*.sh ) -exec npx -y shellcheck {} +
     when: "glob('scripts/*.sh') || glob('bin/*.sh')"
   - name: Markdown
     cmd: "npx -y markdownlint-cli2 **/*.md #node_modules"
@@ -355,3 +355,18 @@ test:
     cmd: "{pm} test"
     when: "script('test') && !project('nodejs')"
     cost: 10
+
+# Semantic search (Phase 5). OFF → pure BM25, no network. ON (default) → the
+# local llama.cpp embedder (:8081) + reranker (:8082) MUST be reachable at
+# index/query time, else `repo` fails loudly — never a silent BM25 fallback.
+# `repo search --bm25` forces pure BM25 per-invocation.
+semantic:
+  enabled: true
+  embed_url: ":8081/v1/embeddings"
+  rerank_url: ":8082/v1/rerank"
+  embed_model: "bge-small"
+  rerank_model: "bge-reranker"
+  timeout_secs: 120
+  bm25_candidates: 50
+  dense_candidates: 50
+  rerank_topn: 10
