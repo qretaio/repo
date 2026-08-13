@@ -1,10 +1,8 @@
 pub mod build;
 pub mod common;
 pub mod context;
-pub mod dev;
 pub mod fmt;
 pub mod index;
-pub mod install;
 pub mod lint;
 pub mod mix;
 pub mod refs;

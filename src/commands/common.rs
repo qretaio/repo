@@ -95,7 +95,23 @@ fn select(cmds: Vec<CommandDef>, g: &Globals, plan: &Plan) -> Vec<CommandDef> {
     }
 }
 
-fn run_group(cmds: &[CommandDef], opts: &RunOptions, mode: &Mode) -> bool {
+/// Drop commands whose `cost` exceeds the global threshold. For handlers that
+/// build their own command lists (lint/fmt preference).
+pub fn cost_filter(cmds: Vec<CommandDef>, g: &Globals) -> Vec<CommandDef> {
+    cmds.into_iter().filter(|c| c.cost <= g.cost).collect()
+}
+
+/// Build run options matching the rest of the CLI's streaming rules.
+pub fn opts(g: &Globals) -> RunOptions {
+    RunOptions {
+        verbose: g.verbose,
+        ..Default::default()
+    }
+}
+
+/// Run one group of commands, resolving argv via `mode`. Returns `true` if all
+/// succeeded. Public so lint/fmt can drive their preference-ordered groups.
+pub fn run_group(cmds: &[CommandDef], opts: &RunOptions, mode: &Mode) -> bool {
     let tasks: Vec<Task> = cmds
         .iter()
         .map(|c| Task {

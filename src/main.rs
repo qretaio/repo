@@ -10,11 +10,12 @@ mod detect;
 mod run;
 mod search;
 mod symbols;
+mod tasks;
 
 use commands::{
-    build::BuildArgs, context::ContextArgs, dev::DevArgs, fmt::FmtArgs, index::IndexArgs,
-    install::InstallArgs, lint::LintArgs, mix::MixArgs, refs::RefsArgs, run::RunArgs,
-    search::SearchArgs, symbols::SymbolsArgs, test::TestArgs,
+    build::BuildArgs, context::ContextArgs, fmt::FmtArgs, index::IndexArgs, lint::LintArgs,
+    mix::MixArgs, refs::RefsArgs, run::RunArgs, search::SearchArgs, symbols::SymbolsArgs,
+    test::TestArgs,
 };
 use detect::Detector;
 
@@ -95,19 +96,12 @@ enum Cmd {
     /// in full mode (the cost filter is ignored).
     Test(TestArgs),
 
-    /// Install dependencies for detected project types.
+    /// Run the project's program/binary, falling back to task runners.
     ///
-    /// npm install, uv sync, cargo fetch, go mod download, gradle/maven resolve.
-    Install(InstallArgs),
-
-    /// Start development servers / watchers.
-    ///
-    /// npm run dev, cargo run, go run ., etc. Output is always streamed live.
-    Dev(DevArgs),
-
-    /// Run the project's program/binary.
-    ///
-    /// cargo run, go run ., npm start, etc. Output always streams live.
+    /// Runs built-in entry commands (cargo run, go run ., npm start, …); if
+    /// none apply, falls back to tasks defined by npm scripts, justfile, make,
+    /// deno, or gradle — trying names `run → start → dev → serve`.
+    /// Output always streams live.
     Run(RunArgs),
 
     /// Pack the repository into a single AI-friendly file (via repomix).
@@ -177,8 +171,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Fmt(a) => commands::fmt::run(&detector, &globals, &a),
         Cmd::Build(a) => commands::build::run(&detector, &globals, &a),
         Cmd::Test(a) => commands::test::run(&detector, &globals, &a),
-        Cmd::Install(a) => commands::install::run(&detector, &globals, &a),
-        Cmd::Dev(a) => commands::dev::run(&detector, &globals, &a),
         Cmd::Run(a) => commands::run::run(&detector, &globals, &a),
         Cmd::Mix(a) => commands::mix::run(&a),
         Cmd::Context(a) => commands::context::run(&detector, &globals, &a),

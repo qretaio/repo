@@ -24,6 +24,10 @@ pub struct CommandDef {
     pub check_cmd: Option<Vec<String>>,
     pub fix_cmd: Option<Vec<String>>,
     pub cost: u32,
+    /// A security/vulnerability check (audit, govulncheck, …). Always runs even
+    /// when a project-defined `lint` task takes over — security is orthogonal
+    /// to whatever the project's own lint script does.
+    pub security: bool,
 }
 
 impl CommandDef {
@@ -43,8 +47,6 @@ pub struct Commands {
     pub fmt: Vec<CommandDef>,
     pub build: Vec<CommandDef>,
     pub test: Vec<CommandDef>,
-    pub install: Vec<CommandDef>,
-    pub dev: Vec<CommandDef>,
     pub run: Vec<CommandDef>,
 }
 
@@ -55,8 +57,6 @@ impl Commands {
             Kind::Fmt => &self.fmt,
             Kind::Build => &self.build,
             Kind::Test => &self.test,
-            Kind::Install => &self.install,
-            Kind::Dev => &self.dev,
             Kind::Run => &self.run,
         }
     }
@@ -67,8 +67,6 @@ impl Commands {
             .chain(self.fmt.iter())
             .chain(self.build.iter())
             .chain(self.test.iter())
-            .chain(self.install.iter())
-            .chain(self.dev.iter())
             .chain(self.run.iter())
     }
 }
@@ -107,8 +105,6 @@ pub enum Kind {
     Fmt,
     Build,
     Test,
-    Install,
-    Dev,
     Run,
 }
 
@@ -118,6 +114,7 @@ pub struct Detector {
     projects: Vec<ProjectType>,
     universal: Commands,
     cel: Context<'static>,
+    task_runners: Arc<crate::tasks::TaskRunners>,
 }
 
 impl Detector {
@@ -126,6 +123,7 @@ impl Detector {
 
         let pkg = read_json("package.json");
         let pm = detect_package_manager().unwrap_or("npm");
+        let task_runners = Arc::new(crate::tasks::TaskRunners::discover(&pkg, pm));
         let cfg = load_config()?;
         let mut cel = cel_context(&pkg);
 
@@ -155,6 +153,14 @@ impl Detector {
             det.contains(id.as_str())
         });
 
+        // Expose `task(name)` — true if any task runner (npm/deno/just/make, and
+        // lazily gradle) defines a task named `name`. Used by `run`/`lint`/`fmt`
+        // fallback + preference logic and available to YAML `when` expressions.
+        let tr = Arc::clone(&task_runners);
+        cel.add_function("task", move |name: Arc<String>| -> bool {
+            tr.has(name.as_str())
+        });
+
         // Phase 4 — validate every `when` expression (project() now available).
         for p in &projects {
             for c in p.commands.all_cmds() {
@@ -170,8 +176,6 @@ impl Detector {
             fmt: build_cmds(&cfg.fmt, pm)?,
             build: build_cmds(&cfg.build, pm)?,
             test: build_cmds(&cfg.test, pm)?,
-            install: build_cmds(&cfg.install, pm)?,
-            dev: build_cmds(&cfg.dev, pm)?,
             run: build_cmds(&cfg.run, pm)?,
         };
         for c in universal.all_cmds() {
@@ -184,6 +188,7 @@ impl Detector {
             projects,
             universal,
             cel,
+            task_runners,
         })
     }
 
@@ -206,6 +211,44 @@ impl Detector {
 
     pub fn universal_commands(&self) -> &Commands {
         &self.universal
+    }
+
+    /// The discovered task runners (npm/deno/just/make/gradle).
+    pub fn task_runners(&self) -> &crate::tasks::TaskRunners {
+        &self.task_runners
+    }
+
+    /// Synthesize a `CommandDef` for the first runner defining `name`
+    /// (priority `just → make → deno → npm → gradle`), else `None`.
+    pub fn runner_cmd(&self, name: &str) -> Option<CommandDef> {
+        let found = self.task_runners.find(name)?;
+        Some(CommandDef {
+            name: found.display(),
+            cmd: found.argv,
+            when: None,
+            check_cmd: None,
+            fix_cmd: None,
+            cost: 0,
+            security: false,
+        })
+    }
+
+    /// Print every runner that defines any of `names`, for `--list` display.
+    pub fn list_runners(&self, names: &[&str]) {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for name in names {
+            for f in self.task_runners.list(name) {
+                rows.push((f.runner.label().to_string(), f.display()));
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+        println!();
+        println!("{}", "Task runners:".blue());
+        for (runner, argv) in rows {
+            println!("  - [{runner}] {argv}");
+        }
     }
 
     pub fn get_applicable(&self, cmds: &[CommandDef]) -> Vec<CommandDef> {
@@ -327,10 +370,6 @@ struct RepoConfig {
     #[serde(default)]
     test: Vec<CommandRaw>,
     #[serde(default)]
-    install: Vec<CommandRaw>,
-    #[serde(default)]
-    dev: Vec<CommandRaw>,
-    #[serde(default)]
     run: Vec<CommandRaw>,
 }
 
@@ -349,10 +388,6 @@ struct ProjectRaw {
     #[serde(default)]
     test: Vec<CommandRaw>,
     #[serde(default)]
-    install: Vec<CommandRaw>,
-    #[serde(default)]
-    dev: Vec<CommandRaw>,
-    #[serde(default)]
     run: Vec<CommandRaw>,
     #[serde(default)]
     context: Option<ContextRaw>,
@@ -370,6 +405,8 @@ struct CommandRaw {
     check: Option<String>,
     #[serde(default)]
     cost: u32,
+    #[serde(default)]
+    security: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -459,8 +496,6 @@ fn merge_pair(mut base: RepoConfig, over: RepoConfig) -> RepoConfig {
             merge_cmds(&mut b.fmt, p.fmt);
             merge_cmds(&mut b.build, p.build);
             merge_cmds(&mut b.test, p.test);
-            merge_cmds(&mut b.install, p.install);
-            merge_cmds(&mut b.dev, p.dev);
             merge_cmds(&mut b.run, p.run);
         } else {
             base.projects.insert(id, p);
@@ -470,8 +505,6 @@ fn merge_pair(mut base: RepoConfig, over: RepoConfig) -> RepoConfig {
     merge_cmds(&mut base.fmt, over.fmt);
     merge_cmds(&mut base.build, over.build);
     merge_cmds(&mut base.test, over.test);
-    merge_cmds(&mut base.install, over.install);
-    merge_cmds(&mut base.dev, over.dev);
     merge_cmds(&mut base.run, over.run);
     base
 }
@@ -494,8 +527,6 @@ fn build_commands(p: &ProjectRaw, pm: &str) -> anyhow::Result<Commands> {
         fmt: build_cmds(&p.fmt, pm)?,
         build: build_cmds(&p.build, pm)?,
         test: build_cmds(&p.test, pm)?,
-        install: build_cmds(&p.install, pm)?,
-        dev: build_cmds(&p.dev, pm)?,
         run: build_cmds(&p.run, pm)?,
     })
 }
@@ -566,6 +597,7 @@ fn build_cmd(raw: &CommandRaw, pm: &str) -> anyhow::Result<CommandDef> {
         fix_cmd: raw.fix.as_ref().map(|s| sub_pm(s, pm)),
         check_cmd: raw.check.as_ref().map(|s| sub_pm(s, pm)),
         cost: raw.cost,
+        security: raw.security,
     })
 }
 
