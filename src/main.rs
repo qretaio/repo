@@ -7,6 +7,7 @@ use std::process;
 mod commands;
 mod context;
 mod detect;
+mod mcp;
 mod run;
 mod search;
 mod symbols;
@@ -14,8 +15,8 @@ mod tasks;
 
 use commands::{
     build::BuildArgs, context::ContextArgs, fmt::FmtArgs, index::IndexArgs, lint::LintArgs,
-    mix::MixArgs, refs::RefsArgs, run::RunArgs, search::SearchArgs, symbols::SymbolsArgs,
-    test::TestArgs,
+    mcp::McpArgs, mix::MixArgs, refs::RefsArgs, run::RunArgs, search::SearchArgs,
+    symbols::SymbolsArgs, test::TestArgs,
 };
 use detect::Detector;
 
@@ -146,6 +147,14 @@ enum Cmd {
     /// `~/.cache/repo/symbols/`. Required once before `repo refs` (which also
     /// auto-builds on first use).
     Symbols(SymbolsArgs),
+
+    /// Run as an MCP server over stdio.
+    ///
+    /// Exposes context/search/refs/task as MCP tools for AI agents. Configure
+    /// a client with: {"mcpServers": {"repo": {"command": "repo", "args":
+    /// ["mcp"]}}} — the server resolves the repo root from its working
+    /// directory.
+    Mcp(McpArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -178,6 +187,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Search(a) => commands::search::run(&detector, &globals, &a),
         Cmd::Refs(a) => commands::refs::run(&detector, &globals, &a),
         Cmd::Symbols(a) => commands::symbols::run(&detector, &globals, &a),
+        Cmd::Mcp(a) => commands::mcp::run(&detector, &globals, &a),
     };
 
     process::exit(code);

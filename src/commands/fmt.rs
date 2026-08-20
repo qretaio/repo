@@ -7,8 +7,9 @@
 use clap::Args;
 use colored::Colorize;
 
-use crate::commands::common::{cost_filter, opts, run_group, Mode};
+use crate::commands::common::{cost_filter, opts, run_group, CoreResult, Mode};
 use crate::detect::{Detector, Kind};
+use crate::run::RunOptions;
 use crate::Globals;
 
 #[derive(Args)]
@@ -28,6 +29,12 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
         return 0;
     }
 
+    core(d, g, args, &opts(g)).exit_code
+}
+
+/// Fmt orchestration shared by the CLI and the MCP `task` tool. Never fails
+/// the exit code; formatting is best-effort.
+pub fn core(d: &Detector, g: &Globals, args: &FmtArgs, opts: &RunOptions) -> CoreResult {
     let detected = d.detect_project_types();
 
     if g.verbose {
@@ -47,7 +54,6 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
         println!("{}", h.bold());
     }
 
-    let opts = opts(g);
     let mode = Mode::Check(args.check);
 
     // A project-defined `fmt` (or `format`) task wins outright — run only it.
@@ -57,20 +63,25 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
             println!();
             println!("{}", "Project-defined format:".blue());
         }
-        run_group(std::slice::from_ref(cmd), &opts, &mode);
-        return 0;
+        let results = run_group(std::slice::from_ref(cmd), opts, &mode);
+        return CoreResult {
+            exit_code: 0,
+            error: None,
+            results,
+        };
     }
 
     // No project formatter: built-in universal + per-project (best-effort).
     let universal = cost_filter(d.get_applicable(d.universal_commands().get(Kind::Fmt)), g);
     let mut ran = false;
+    let mut results = Vec::new();
     if !universal.is_empty() {
         ran = true;
         if g.verbose {
             println!();
             println!("{}", "Universal:".blue());
         }
-        run_group(&universal, &opts, &mode);
+        results.extend(run_group(&universal, opts, &mode));
     }
 
     for project in &detected {
@@ -83,11 +94,15 @@ pub fn run(d: &Detector, g: &Globals, args: &FmtArgs) -> i32 {
             println!();
             println!("{}", format!("{}:", project.name).blue());
         }
-        run_group(&cmds, &opts, &mode);
+        results.extend(run_group(&cmds, opts, &mode));
     }
 
-    if !ran {
+    if !ran && !opts.quiet {
         println!("{}", "No formatters configured".yellow());
     }
-    0
+    CoreResult {
+        exit_code: 0,
+        error: None,
+        results,
+    }
 }

@@ -14,6 +14,9 @@ use duct::Expression;
 pub struct RunOptions {
     pub verbose: bool,
     pub cwd: Option<PathBuf>,
+    /// Machine-facing mode (MCP): never print reports, always capture child
+    /// output (even cost ≥ 10), and don't force color envs on children.
+    pub quiet: bool,
 }
 
 /// A named command to execute.
@@ -97,16 +100,24 @@ fn with_color_env(expr: Expression) -> Expression {
 
 pub fn run_command(task: &Task, opts: &RunOptions) -> RunResult {
     let start = Instant::now();
-    let mut expr = with_color_env(duct::cmd(&task.cmd[0], &task.cmd[1..])).stdin_null();
+    let mut expr = duct::cmd(&task.cmd[0], &task.cmd[1..]).stdin_null();
     if let Some(dir) = &opts.cwd {
         expr = expr.dir(dir);
     }
-    // Expensive commands (cost ≥ 10) stream live; cheap ones capture unless --verbose.
-    let stream = opts.verbose || task.cost >= 10;
+    // Expensive commands (cost ≥ 10) stream live; cheap ones capture unless
+    // --verbose. Quiet mode always captures (protocol-safe: nothing may write
+    // to our stdout).
+    let stream = (opts.verbose || task.cost >= 10) && !opts.quiet;
     let expr = if stream {
         expr
     } else {
         expr.stdout_capture().stderr_capture()
+    };
+    // Forced color only helps terminal humans; quiet mode wants plain text.
+    let expr = if opts.quiet {
+        expr
+    } else {
+        with_color_env(expr)
     };
 
     match expr.unchecked().run() {
@@ -147,7 +158,9 @@ pub fn run_commands(tasks: &[Task], opts: &RunOptions) -> Vec<RunResult> {
     });
 
     for res in &results {
-        res.report();
+        if !opts.quiet {
+            res.report();
+        }
     }
     results
 }

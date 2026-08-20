@@ -3,6 +3,7 @@
 use clap::Args;
 use colored::Colorize;
 
+use crate::commands::common::{all_ok, CoreResult};
 use crate::detect::{Detector, Kind};
 use crate::run::{run_commands, RunOptions, Task};
 use crate::Globals;
@@ -26,17 +27,32 @@ pub fn run(d: &Detector, g: &Globals, args: &TestArgs) -> i32 {
         return 0;
     }
 
-    // Always run all tests (cost filter ignored — mirrors getCommandsByType).
+    core(
+        d,
+        g,
+        args,
+        &RunOptions {
+            verbose: g.verbose,
+            ..Default::default()
+        },
+    )
+    .exit_code
+}
+
+/// Test orchestration shared by the CLI and the MCP `task` tool. Always runs
+/// all tests (cost filter ignored — mirrors getCommandsByType).
+pub fn core(d: &Detector, g: &Globals, args: &TestArgs, opts: &RunOptions) -> CoreResult {
     let commands = d.get_commands_by_type(Kind::Test);
     if commands.is_empty() {
-        println!("{}", "No testable projects detected".yellow());
-        return 0;
+        if !opts.quiet {
+            println!("{}", "No testable projects detected".yellow());
+        }
+        return CoreResult {
+            exit_code: 0,
+            error: None,
+            results: Vec::new(),
+        };
     }
-
-    let opts = RunOptions {
-        verbose: g.verbose,
-        ..Default::default()
-    };
 
     if g.verbose {
         println!("{}", "🧪 Running tests".bold());
@@ -60,9 +76,11 @@ pub fn run(d: &Detector, g: &Globals, args: &TestArgs) -> i32 {
         })
         .collect();
 
-    let results = run_commands(&tasks, &opts);
-    if !results.iter().all(|r| r.success) {
-        return 1;
+    let results = run_commands(&tasks, opts);
+    let exit_code = if all_ok(&results) { 0 } else { 1 };
+    CoreResult {
+        exit_code,
+        error: None,
+        results,
     }
-    0
 }

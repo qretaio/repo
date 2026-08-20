@@ -39,18 +39,9 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
     // Ensure the store is current before querying. `build` is a no-op when the
     // store is fresh; otherwise (missing, schema-bumped/empty, or source
     // changed) it rebuilds — so refs never silently serve stale/empty data.
-    match symbols::build(&root, false) {
-        Ok(stats) if stats.rebuilt => {
-            eprintln!(
-                "{}",
-                format!("Indexed {} symbols in {} files.", stats.defs, stats.files).cyan()
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("{}", format!("Error: {e}").red());
-            return 1;
-        }
+    if let Err(e) = ensure_store(&root) {
+        eprintln!("{}", format!("Error: {e}").red());
+        return 1;
     }
 
     // No symbol (or blank) → list the symbols available for lookup.
@@ -59,7 +50,7 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
         _ => return list_symbols(&root, args.json),
     };
 
-    let defs = match symbols::definitions(&root, symbol) {
+    let data = match refs_data(&root, symbol, args.defs_only) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("{}", format!("Error: {e}").red());
@@ -67,46 +58,7 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
         }
     };
 
-    // A symbol's definitions include both the type itself and its `impl` blocks
-    // (both are named after the type). Split them; `methods` are the defs whose
-    // enclosing type is this symbol.
-    let type_defs: Vec<Definition> = defs
-        .iter()
-        .filter(|d| d.kind != DefKind::Impl)
-        .cloned()
-        .collect();
-    let impls: Vec<Definition> = defs
-        .iter()
-        .filter(|d| d.kind == DefKind::Impl)
-        .cloned()
-        .collect();
-
-    let methods = if args.defs_only {
-        Vec::new()
-    } else {
-        symbols::children(&root, symbol).unwrap_or_default()
-    };
-
-    let importers = if args.defs_only {
-        Vec::new()
-    } else {
-        symbols::importers(&root, symbol).unwrap_or_default()
-    };
-
-    let mut refs = if args.defs_only {
-        Vec::new()
-    } else {
-        symbols::references(&root, symbol)
-    };
-
-    // Drop reference lines that are themselves a definition site (avoids dupes).
-    let def_sites: HashSet<(String, u32)> = defs
-        .iter()
-        .map(|d| (d.file_path.clone(), d.start_line))
-        .collect();
-    refs.retain(|r| !def_sites.contains(&(r.file_path.clone(), r.line)));
-
-    if defs.is_empty() && methods.is_empty() && importers.is_empty() && refs.is_empty() {
+    if !data.found() {
         if !args.json {
             eprintln!("{}", format!("No occurrences of {symbol:?}.").yellow());
         }
@@ -114,8 +66,61 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
     }
 
     if args.json {
-        let mut pool = methods.clone();
-        let impls_json: Vec<_> = impls
+        println!("{}", data.to_json(symbol));
+        return 0;
+    }
+
+    data.render(symbol);
+    0
+}
+
+/// Ensure the tree-sitter symbol store is current; prints a stderr note when
+/// a rebuild happened (stderr is safe for the MCP stdio transport). Errors
+/// propagate to the caller for display.
+pub(crate) fn ensure_store(root: &std::path::Path) -> anyhow::Result<()> {
+    match symbols::build(root, false) {
+        Ok(stats) if stats.rebuilt => {
+            eprintln!(
+                "{}",
+                format!("Indexed {} symbols in {} files.", stats.defs, stats.files).cyan()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// Everything known about one symbol, split for rendering. Shared by the CLI
+/// and the MCP `refs` tool.
+pub(crate) struct RefsData {
+    /// Definitions of the type itself (kind != impl).
+    pub type_defs: Vec<Definition>,
+    /// `impl` blocks for the type (also named after it).
+    pub impls: Vec<Definition>,
+    /// Methods whose enclosing type is this symbol (empty when defs_only).
+    pub methods: Vec<Definition>,
+    /// Files importing the symbol (empty when defs_only).
+    pub importers: Vec<String>,
+    /// Non-definition usage sites (empty when defs_only).
+    pub refs: Vec<symbols::Reference>,
+}
+
+impl RefsData {
+    pub fn found(&self) -> bool {
+        self.type_defs.is_empty()
+            && self.impls.is_empty()
+            && self.methods.is_empty()
+            && self.importers.is_empty()
+            && self.refs.is_empty()
+    }
+
+    /// The CLI `--json` payload (byte-identical): impls nest their contained
+    /// methods; `methods` carries those not inside any recorded impl.
+    pub fn to_json(&self, symbol: &str) -> serde_json::Value {
+        let mut pool = self.methods.clone();
+        let impls_json: Vec<_> = self
+            .impls
             .iter()
             .map(|imp| {
                 let mut nested = Vec::new();
@@ -134,97 +139,153 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
                 })
             })
             .collect();
-        let payload = json!({
+        json!({
             "symbol": symbol,
-            "definitions": type_defs.iter().map(def_json).collect::<Vec<_>>(),
+            "definitions": self.type_defs.iter().map(def_json).collect::<Vec<_>>(),
             "impls": impls_json,
             "methods": pool.iter().map(def_json).collect::<Vec<_>>(),
-            "importers": importers,
-            "references": refs.iter().map(|r| json!({
+            "importers": self.importers,
+            "references": self.refs.iter().map(|r| json!({
                 "path": r.file_path, "line": r.line, "column": r.column, "text": r.text,
             })).collect::<Vec<_>>(),
-        });
-        println!("{payload}");
-        return 0;
+        })
     }
 
-    println!(
-        "{}",
-        format!(
-            "{symbol:?}: {} def(s), {} impl(s), {} method(s), {} importer(s), {} reference(s)",
-            type_defs.len(),
-            impls.len(),
-            methods.len(),
-            importers.len(),
-            refs.len(),
-        )
-        .bold()
-    );
+    /// Human rendering (the CLI default output).
+    fn render(&self, symbol: &str) {
+        println!(
+            "{}",
+            format!(
+                "{symbol:?}: {} def(s), {} impl(s), {} method(s), {} importer(s), {} reference(s)",
+                self.type_defs.len(),
+                self.impls.len(),
+                self.methods.len(),
+                self.importers.len(),
+                self.refs.len(),
+            )
+            .bold()
+        );
 
-    if !type_defs.is_empty() || !impls.is_empty() {
-        println!("\n{}", "Definitions:".green().bold());
-        for d in &type_defs {
-            let parent_note = d
-                .parent
-                .as_deref()
-                .map(|p| format!(" (in {p})"))
-                .unwrap_or_default();
-            println!(
-                "  {} {}{}",
-                decl_head(d),
-                format!("{}:{}", d.file_path, d.start_line).cyan(),
-                parent_note.bright_black(),
-            );
-        }
-        // Each impl block with its methods nested by source containment.
-        let mut pool = methods.clone();
-        for imp in &impls {
-            println!(
-                "  {} {} {}",
-                "impl".bright_black(),
-                imp.name.bold(),
-                format!("{}:{}-{}", imp.file_path, imp.start_line, imp.end_line).cyan(),
-            );
-            let mut i = 0;
-            while i < pool.len() {
-                let m = &pool[i];
-                if m.file_path == imp.file_path
-                    && imp.start_line <= m.start_line
-                    && m.start_line <= imp.end_line
-                {
-                    println!("    {} ({})", decl_head(m), m.start_line);
-                    pool.remove(i);
-                } else {
-                    i += 1;
+        if !self.type_defs.is_empty() || !self.impls.is_empty() {
+            println!("\n{}", "Definitions:".green().bold());
+            for d in &self.type_defs {
+                let parent_note = d
+                    .parent
+                    .as_deref()
+                    .map(|p| format!(" (in {p})"))
+                    .unwrap_or_default();
+                println!(
+                    "  {} {}{}",
+                    decl_head(d),
+                    format!("{}:{}", d.file_path, d.start_line).cyan(),
+                    parent_note.bright_black(),
+                );
+            }
+            // Each impl block with its methods nested by source containment.
+            let mut pool = self.methods.clone();
+            for imp in &self.impls {
+                println!(
+                    "  {} {} {}",
+                    "impl".bright_black(),
+                    imp.name.bold(),
+                    format!("{}:{}-{}", imp.file_path, imp.start_line, imp.end_line).cyan(),
+                );
+                let mut i = 0;
+                while i < pool.len() {
+                    let m = &pool[i];
+                    if m.file_path == imp.file_path
+                        && imp.start_line <= m.start_line
+                        && m.start_line <= imp.end_line
+                    {
+                        println!("    {} ({})", decl_head(m), m.start_line);
+                        pool.remove(i);
+                    } else {
+                        i += 1;
+                    }
                 }
             }
+            // Methods not inside any recorded impl (e.g. Python/TS class methods).
+            for m in &pool {
+                println!(
+                    "  {} {}",
+                    decl_head(m),
+                    format!("{}:{}", m.file_path, m.start_line).cyan(),
+                );
+            }
         }
-        // Methods not inside any recorded impl (e.g. Python/TS class methods).
-        for m in &pool {
-            println!(
-                "  {} {}",
-                decl_head(m),
-                format!("{}:{}", m.file_path, m.start_line).cyan(),
-            );
+        if !self.importers.is_empty() {
+            println!("\n{}", "Imported by:".magenta().bold());
+            for f in &self.importers {
+                println!("  {}", f.cyan());
+            }
+        }
+        if !self.refs.is_empty() {
+            println!("\n{}", "References:".blue().bold());
+            for r in &self.refs {
+                println!(
+                    "  {} │ {}",
+                    format!("{}:{}", r.file_path, r.line).cyan(),
+                    r.text
+                );
+            }
         }
     }
-    if !importers.is_empty() {
-        println!("\n{}", "Imported by:".magenta().bold());
-        for f in &importers {
-            println!("  {}", f.cyan());
-        }
-    }
-    if !refs.is_empty() {
-        println!("\n{}", "References:".blue().bold());
-        for r in &refs {
-            println!(
-                "  {} │ {}",
-                format!("{}:{}", r.file_path, r.line).cyan(),
-                r.text
-            );
-        }
-    }
-    0
+}
+
+/// Gather definitions, impls, methods, importers, and references for `symbol`.
+pub(crate) fn refs_data(
+    root: &std::path::Path,
+    symbol: &str,
+    defs_only: bool,
+) -> anyhow::Result<RefsData> {
+    let defs = symbols::definitions(root, symbol)?;
+
+    // A symbol's definitions include both the type itself and its `impl` blocks
+    // (both are named after the type). Split them; `methods` are the defs whose
+    // enclosing type is this symbol.
+    let type_defs: Vec<Definition> = defs
+        .iter()
+        .filter(|d| d.kind != DefKind::Impl)
+        .cloned()
+        .collect();
+    let impls: Vec<Definition> = defs
+        .iter()
+        .filter(|d| d.kind == DefKind::Impl)
+        .cloned()
+        .collect();
+
+    let methods = if defs_only {
+        Vec::new()
+    } else {
+        symbols::children(root, symbol).unwrap_or_default()
+    };
+
+    let importers = if defs_only {
+        Vec::new()
+    } else {
+        symbols::importers(root, symbol).unwrap_or_default()
+    };
+
+    let mut refs = if defs_only {
+        Vec::new()
+    } else {
+        symbols::references(root, symbol)
+    };
+
+    // Drop reference lines that are themselves a definition site (avoids dupes).
+    let def_sites: HashSet<(String, u32)> = defs
+        .iter()
+        .map(|d| (d.file_path.clone(), d.start_line))
+        .collect();
+    refs.retain(|r| !def_sites.contains(&(r.file_path.clone(), r.line)));
+
+    Ok(RefsData {
+        type_defs,
+        impls,
+        methods,
+        importers,
+        refs,
+    })
 }
 
 /// With no symbol argument, list the symbols available for lookup: every
@@ -246,32 +307,36 @@ fn list_symbols(root: &std::path::Path, json: bool) -> i32 {
     }
 
     if json {
-        // name -> (distinct kinds, site count)
-        let mut groups: std::collections::BTreeMap<
-            &str,
-            (std::collections::BTreeSet<&str>, usize),
-        > = std::collections::BTreeMap::new();
-        for d in &all {
-            let g = groups.entry(d.name.as_str()).or_default();
-            g.0.insert(d.kind.label());
-            g.1 += 1;
-        }
-        let arr: Vec<_> = groups
-            .iter()
-            .map(|(name, (kinds, count))| {
-                json!({
-                    "name": name,
-                    "kinds": kinds.iter().copied().collect::<Vec<_>>(),
-                    "definitions": count,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::Value::Array(arr));
+        println!("{}", group_list_json(&all));
         return 0;
     }
 
     render_outline(&all);
     0
+}
+
+/// Group every definition by name: `[{name, kinds, definitions}, …]`, sorted.
+/// Shared by the CLI `--json` list mode and the MCP `refs` tool.
+pub(crate) fn group_list_json(all: &[Definition]) -> serde_json::Value {
+    // name -> (distinct kinds, site count)
+    let mut groups: std::collections::BTreeMap<&str, (std::collections::BTreeSet<&str>, usize)> =
+        std::collections::BTreeMap::new();
+    for d in all {
+        let g = groups.entry(d.name.as_str()).or_default();
+        g.0.insert(d.kind.label());
+        g.1 += 1;
+    }
+    let arr: Vec<_> = groups
+        .iter()
+        .map(|(name, (kinds, count))| {
+            json!({
+                "name": name,
+                "kinds": kinds.iter().copied().collect::<Vec<_>>(),
+                "definitions": count,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr)
 }
 
 /// Render a repo-wide hierarchical outline: every type expanded with its

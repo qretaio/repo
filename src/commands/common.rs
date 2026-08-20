@@ -7,7 +7,7 @@
 use colored::Colorize;
 
 use crate::detect::{command_for_mode, CommandDef, Detector, Kind, ProjectType};
-use crate::run::{run_commands, RunOptions, Task};
+use crate::run::{run_commands, RunOptions, RunResult, Task};
 use crate::Globals;
 
 /// How to resolve a `CommandDef` into the argv to actually run.
@@ -39,17 +39,48 @@ pub struct Plan {
     pub mode: Mode,
 }
 
+/// Result of a command core: process exit code plus every executed command's
+/// captured result (empty stdout/stderr when not quiet — `run_commands`
+/// captures for cheap tasks regardless).
+pub struct CoreResult {
+    pub exit_code: i32,
+    /// Human-readable failure reason for pre-execution errors (e.g. unknown
+    /// project-type filter); `None` once commands actually ran.
+    pub error: Option<String>,
+    pub results: Vec<crate::run::RunResult>,
+}
+
+impl CoreResult {
+    /// Derive the exit code from the results (1 when any command failed).
+    pub fn from_results(results: Vec<RunResult>) -> Self {
+        let exit_code = if all_ok(&results) { 0 } else { 1 };
+        Self {
+            exit_code,
+            error: None,
+            results,
+        }
+    }
+}
+
+/// True when every command in the group succeeded.
+pub fn all_ok(results: &[crate::run::RunResult]) -> bool {
+    results.iter().all(|r| r.success)
+}
+
 /// Run universal (optional) + per-project commands for `plan.kind`.
 ///
 /// `detected` is the (possibly filtered) project list, owned by the caller so
-/// commands like `lint -t rust` can pre-filter. Returns `(exit_code, ran)`
-/// where `ran` is true if at least one command group actually executed.
-pub fn execute(d: &Detector, g: &Globals, detected: &[&ProjectType], plan: &Plan) -> (i32, bool) {
-    let opts = RunOptions {
-        verbose: g.verbose,
-        ..Default::default()
-    };
+/// commands like `lint -t rust` can pre-filter. `opts` controls quiet/capture
+/// behavior (CLI passes `opts(g)`, MCP passes a quiet variant).
+pub fn execute(
+    d: &Detector,
+    g: &Globals,
+    detected: &[&ProjectType],
+    plan: &Plan,
+    opts: &RunOptions,
+) -> CoreResult {
     let mut ran = false;
+    let mut results = Vec::new();
 
     if plan.include_universal {
         let universal: Vec<CommandDef> = select(
@@ -62,9 +93,16 @@ pub fn execute(d: &Detector, g: &Globals, detected: &[&ProjectType], plan: &Plan
             if g.verbose {
                 println!("{}", "\nUniversal:".blue());
             }
-            if !run_group(&universal, &opts, &plan.mode) && !plan.continue_on_error {
-                return (1, ran);
+            let r = run_group(&universal, opts, &plan.mode);
+            if !all_ok(&r) && !plan.continue_on_error {
+                results.extend(r);
+                return CoreResult {
+                    exit_code: 1,
+                    error: None,
+                    results,
+                };
             }
+            results.extend(r);
         }
     }
 
@@ -78,12 +116,27 @@ pub fn execute(d: &Detector, g: &Globals, detected: &[&ProjectType], plan: &Plan
         if g.verbose {
             println!("{}", format!("\n{}:", project.name).blue());
         }
-        if !run_group(&commands, &opts, &plan.mode) && !plan.continue_on_error {
-            return (1, ran);
+        let r = run_group(&commands, opts, &plan.mode);
+        if !all_ok(&r) && !plan.continue_on_error {
+            results.extend(r);
+            return CoreResult {
+                exit_code: 1,
+                error: None,
+                results,
+            };
         }
+        results.extend(r);
     }
 
-    (0, ran)
+    if !ran {
+        CoreResult {
+            exit_code: 0,
+            error: None,
+            results,
+        }
+    } else {
+        CoreResult::from_results(results)
+    }
 }
 
 /// Apply the cost filter (if enabled) to a command list.
@@ -109,9 +162,10 @@ pub fn opts(g: &Globals) -> RunOptions {
     }
 }
 
-/// Run one group of commands, resolving argv via `mode`. Returns `true` if all
-/// succeeded. Public so lint/fmt can drive their preference-ordered groups.
-pub fn run_group(cmds: &[CommandDef], opts: &RunOptions, mode: &Mode) -> bool {
+/// Run one group of commands, resolving argv via `mode`. Returns the captured
+/// results (already reported by `run_commands` unless quiet). Public so
+/// lint/fmt can drive their preference-ordered groups.
+pub fn run_group(cmds: &[CommandDef], opts: &RunOptions, mode: &Mode) -> Vec<RunResult> {
     let tasks: Vec<Task> = cmds
         .iter()
         .map(|c| Task {
@@ -120,7 +174,7 @@ pub fn run_group(cmds: &[CommandDef], opts: &RunOptions, mode: &Mode) -> bool {
             cost: c.cost,
         })
         .collect();
-    run_commands(&tasks, opts).iter().all(|r| r.success)
+    run_commands(&tasks, opts)
 }
 
 /// Live-run every detected project's commands for `kind` (dev servers / program

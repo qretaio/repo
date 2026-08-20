@@ -152,7 +152,7 @@ pub fn run(_detector: &Detector, _globals: &Globals, args: &SearchArgs) -> i32 {
     0
 }
 
-fn index_exists(root: &std::path::Path) -> bool {
+pub(crate) fn index_exists(root: &std::path::Path) -> bool {
     search::index::index_dir(root)
         .map(|d| d.join("meta.json").exists())
         .unwrap_or(false)

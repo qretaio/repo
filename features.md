@@ -127,8 +127,11 @@ Exhaustive regex hits grouped by enclosing symbol, ranked by coupling. Needs X1 
 #### G4. Method-call resolution through receiver type
 Resolve `self.router.get()` → `APIRouter.get` via constructor assignments + annotations. Two sub-gaps: no call edges (X1) + no type binding (per-function type inference). **Effort:** L. **Leverage:** H for method-heavy repos, M otherwise.
 
-#### G8. MCP server (Graft 6 tools / CRG 30 tools)
-Expose `refs`/`search`/`symbols`/`map`/`review` as MCP tools. Rust MCP SDK exists. **Effort:** M. **Leverage:** M–H.
+#### G8. MCP server (Graft 6 tools / CRG 30 tools) — DONE (2026-08-20)
+`repo mcp` exposes `context`/`search`/`refs`/`task` over stdio (rmcp 3). Kept
+to 4 tools: refs subsumes symbols (store auto-builds), search subsumes index,
+`task(kind)` subsumes lint/fmt/build/test. Not exposed: `run` (live-streaming,
+hangs request/response), `mix` (repomix shell-out). See CONTEXT.md "MCP server".
 
 ### Tier C — Needs a model (decided: externalize to local llama.cpp)
 

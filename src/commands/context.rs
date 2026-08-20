@@ -107,7 +107,12 @@ pub fn run(d: &Detector, _g: &Globals, args: &ContextArgs) -> i32 {
     0
 }
 
-fn compute(d: &Detector, base: &std::path::Path, args: &ContextArgs) -> anyhow::Result<String> {
+/// Build the context document. Shared by the CLI and the MCP `context` tool.
+pub(crate) fn compute(
+    d: &Detector,
+    base: &std::path::Path,
+    args: &ContextArgs,
+) -> anyhow::Result<String> {
     if args.git_only {
         return Ok(match context::gather_git(base) {
             Some(git) => serde_json::to_string_pretty(&git)

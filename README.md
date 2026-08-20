@@ -32,6 +32,35 @@ repo test --watch      # watch mode (if supported)
 repo mix               # repomix passthrough
 ```
 
+## MCP server
+
+Run repo as an [MCP](https://modelcontextprotocol.io) server over stdio,
+exposing its features directly to AI agents:
+
+```bash
+repo mcp
+```
+
+Client configuration (opencode, Claude Desktop, Cursor, …) — spawn one server
+per workspace; the server resolves the repo root from its working directory:
+
+```json
+{
+  "mcpServers": {
+    "repo": { "command": "repo", "args": ["mcp"] }
+  }
+}
+```
+
+Four tools:
+
+| Tool    | Maps to            | Notes                                              |
+| ------- | ------------------ | -------------------------------------------------- |
+| `context` | `repo context`   | repo overview; optional stats/analysis/audit/symbols |
+| `search`  | `repo search`    | hybrid BM25 + semantic; auto-builds the index       |
+| `refs`    | `repo refs`      | symbol defs/impls/methods/importers/references; omit the symbol to list all |
+| `task`    | `repo lint/fmt/build/test` | one tool, `kind` parameter; captured per-command results, `isError` on failure |
+
 ## Global options
 
 - `--full`: run all commands, including heavy ones (> 5s).

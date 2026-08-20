@@ -2,8 +2,9 @@
 //! Note: `--check` is cosmetic only (changes the header text); build never
 //! selects check_cmd variants — it always runs `cmd`. This mirrors the TS.
 
-use crate::commands::common::{execute, Mode, Plan};
+use crate::commands::common::{execute, opts, CoreResult, Mode, Plan};
 use crate::detect::{Detector, Kind};
+use crate::run::RunOptions;
 use crate::Globals;
 use clap::Args;
 use colored::Colorize;
@@ -24,10 +25,21 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
         return 0;
     }
 
+    core(d, g, args, &opts(g)).exit_code
+}
+
+/// Build orchestration shared by the CLI and the MCP `task` tool.
+pub fn core(d: &Detector, g: &Globals, args: &BuildArgs, opts: &RunOptions) -> CoreResult {
     let detected = d.detect_project_types();
     if detected.is_empty() {
-        println!("{}", "No buildable projects detected".yellow());
-        return 0;
+        if !opts.quiet {
+            println!("{}", "No buildable projects detected".yellow());
+        }
+        return CoreResult {
+            exit_code: 0,
+            error: None,
+            results: Vec::new(),
+        };
     }
 
     if g.verbose {
@@ -54,5 +66,5 @@ pub fn run(d: &Detector, g: &Globals, args: &BuildArgs) -> i32 {
         continue_on_error: false,
         mode: Mode::Normal,
     };
-    execute(d, g, &detected, &plan).0
+    execute(d, g, &detected, &plan, opts)
 }

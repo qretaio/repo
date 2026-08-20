@@ -9,8 +9,9 @@
 use clap::Args;
 use colored::Colorize;
 
-use crate::commands::common::{cost_filter, opts, run_group, Mode};
+use crate::commands::common::{all_ok, cost_filter, opts, run_group, CoreResult, Mode};
 use crate::detect::{Detector, Kind};
+use crate::run::RunOptions;
 use crate::Globals;
 
 #[derive(Args)]
@@ -33,21 +34,37 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         return 0;
     }
 
+    let r = core(d, g, args, &opts(g));
+    if let Some(e) = &r.error {
+        eprintln!("{}", format!("Error: {e}").red());
+    }
+    r.exit_code
+}
+
+/// Lint orchestration shared by the CLI and the MCP `task` tool. `opts`
+/// controls printing/capture (`quiet` for MCP).
+pub fn core(d: &Detector, g: &Globals, args: &LintArgs, opts: &RunOptions) -> CoreResult {
     let mut detected = d.detect_project_types();
     if let Some(t) = &args.r#type {
         detected.retain(|p| p.id.eq_ignore_ascii_case(t));
         if detected.is_empty() {
-            eprintln!(
-                "{}",
-                format!("Error: Project type '{t}' not detected").red()
-            );
-            return 1;
+            return CoreResult {
+                exit_code: 1,
+                error: Some(format!("Project type '{t}' not detected")),
+                results: Vec::new(),
+            };
         }
     }
 
     if !args.fix && detected.is_empty() {
-        println!("{}", "No known project types detected".yellow());
-        return 0;
+        if !opts.quiet {
+            println!("{}", "No known project types detected".yellow());
+        }
+        return CoreResult {
+            exit_code: 0,
+            error: None,
+            results: Vec::new(),
+        };
     }
 
     if g.verbose {
@@ -62,11 +79,11 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
         println!("{}", h.blue());
     }
 
-    let opts = opts(g);
     let mode = Mode::Fix(args.fix);
     // A project-defined `lint` task (npm/just/make/deno/gradle). When present,
     // it replaces the redundant project-specific linters but NOT security.
     let repo_lint = d.runner_cmd("lint");
+    let mut results = Vec::new();
 
     // 1. The project's own lint script first (if any).
     if let Some(cmd) = &repo_lint {
@@ -74,9 +91,16 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
             println!();
             println!("{}", "Project-defined lint:".blue());
         }
-        if !run_group(std::slice::from_ref(cmd), &opts, &mode) && !args.fix {
-            return 1;
+        let r = run_group(std::slice::from_ref(cmd), opts, &mode);
+        if !all_ok(&r) && !args.fix {
+            results.extend(r);
+            return CoreResult {
+                exit_code: 1,
+                error: None,
+                results,
+            };
         }
+        results.extend(r);
     }
 
     // 2. Universal linters (Semgrep, Gitleaks, Trivy, Knip, …) — always run.
@@ -86,9 +110,16 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
             println!();
             println!("{}", "Universal:".blue());
         }
-        if !run_group(&universal, &opts, &mode) && !args.fix {
-            return 1;
+        let r = run_group(&universal, opts, &mode);
+        if !all_ok(&r) && !args.fix {
+            results.extend(r);
+            return CoreResult {
+                exit_code: 1,
+                error: None,
+                results,
+            };
         }
+        results.extend(r);
     }
 
     // 3. Per-project linters. When a project lint task took over, keep only its
@@ -106,10 +137,17 @@ pub fn run(d: &Detector, g: &Globals, args: &LintArgs) -> i32 {
             println!();
             println!("{}", format!("{}:", project.name).blue());
         }
-        if !run_group(&cmds, &opts, &mode) && !args.fix {
-            return 1;
+        let r = run_group(&cmds, opts, &mode);
+        if !all_ok(&r) && !args.fix {
+            results.extend(r);
+            return CoreResult {
+                exit_code: 1,
+                error: None,
+                results,
+            };
         }
+        results.extend(r);
     }
 
-    0
+    CoreResult::from_results(results)
 }

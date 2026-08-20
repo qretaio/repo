@@ -4,6 +4,7 @@ pub mod context;
 pub mod fmt;
 pub mod index;
 pub mod lint;
+pub mod mcp;
 pub mod mix;
 pub mod refs;
 pub mod run;
