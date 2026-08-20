@@ -58,7 +58,7 @@ pub fn run(_d: &Detector, _g: &Globals, args: &RefsArgs) -> i32 {
         }
     };
 
-    if !data.found() {
+    if data.is_empty() {
         if !args.json {
             eprintln!("{}", format!("No occurrences of {symbol:?}.").yellow());
         }
@@ -107,7 +107,8 @@ pub(crate) struct RefsData {
 }
 
 impl RefsData {
-    pub fn found(&self) -> bool {
+    /// True when nothing at all is known about the symbol.
+    pub fn is_empty(&self) -> bool {
         self.type_defs.is_empty()
             && self.impls.is_empty()
             && self.methods.is_empty()
@@ -482,4 +483,53 @@ fn decl_head(d: &Definition) -> String {
     d.signature
         .clone()
         .unwrap_or_else(|| format!("{} {}", d.kind.keyword(), d.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a symbol that exists must NOT report as empty (an inverted
+    /// emptiness check once made every CLI lookup print "No occurrences").
+    #[test]
+    fn refs_data_finds_existing_symbol() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("repo-refs-test-{n}"));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"rt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src").join("lib.rs"),
+            "pub struct Widget { x: u32 }\nimpl Widget { pub fn spin(&self) -> u32 { self.x } }\n",
+        )
+        .unwrap();
+
+        crate::symbols::build(&dir, true).unwrap();
+        let data = refs_data(&dir, "Widget", false).unwrap();
+        assert!(!data.is_empty(), "Widget must be found");
+        assert_eq!(data.type_defs.len(), 1);
+        assert_eq!(data.impls.len(), 1);
+        assert_eq!(data.methods.len(), 1);
+
+        let j = data.to_json("Widget");
+        assert_eq!(j["definitions"][0]["name"], "Widget");
+        assert_eq!(j["impls"][0]["methods"][0]["name"], "spin");
+
+        // defs_only drops methods/importers/references but keeps definitions.
+        let d2 = refs_data(&dir, "Widget", true).unwrap();
+        assert!(!d2.is_empty());
+        assert!(d2.methods.is_empty());
+
+        // Unknown symbol → empty.
+        let missing = refs_data(&dir, "NoSuchSymbol", false).unwrap();
+        assert!(missing.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

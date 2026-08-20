@@ -4,14 +4,15 @@
 //! Stage 2: dense — query embedding vs stored chunk embeddings (cosine).
 //! Stage 3: cross-encoder rerank — `/v1/rerank` over the union of (1) + (2).
 //!
-//! Inference is externalized to a **local llama.cpp** the user runs (see
-//! `scripts/llama-semantic.sh`) — no bundled ONNX, no model weights, no API
-//! key. Storage is a sidecar `vectors.db` beside the BM25 index: every chunk
+//! Inference is externalized to the local llama-swap gateway (:8282,
+//! LaunchAgent `com.mostlygeek.llama-swap` — starts at login, KeepAlive) —
+//! no bundled ONNX, no model weights, no API key. Storage is a sidecar
+//! `vectors.db` beside the BM25 index: every chunk
 //! is embedded at index time and cached there.
 //!
 //! Contract: semantic is **on by default** (`semantic.enabled: true` in the
-//! embedded defaults). OFF → pure BM25, never touches the network. ON → both
-//! llama.cpp servers MUST be reachable at index/query time; unreachable is a
+//! embedded defaults). OFF → pure BM25, never touches the network. ON → the
+//! gateway MUST be reachable at index/query time; unreachable is a
 //! hard error, **never** a silent BM25 fallback. `repo search --bm25`
 //! overrides per-invocation.
 
