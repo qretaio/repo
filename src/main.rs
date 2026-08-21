@@ -158,7 +158,8 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    human_panic::setup_panic(|| human_panic::Metadata::new("repo", env!("CARGO_PKG_VERSION")));
+    let cli = Cli::parse_from(wild::args());
 
     let Some(command) = cli.command else {
         // No subcommand: show help and succeed (help is not an error; avoids

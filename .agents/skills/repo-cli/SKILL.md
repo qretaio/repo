@@ -8,7 +8,7 @@ repo — a command only runs when its own config is present.
 
 **Command groups:**
 
-- **quality** — `lint` `fmt` `build` `test` `install` `dev` `run`: per-project,
+- **quality** — `lint` `fmt` `build` `test` `run`: per-project,
   auto-detected. Universal checks (Semgrep, Gitleaks, …) with `--full`.
 - **understand** — `context` (`ctx`): AI-ready snapshot (git, metadata, deps,
   TODOs, structure). `--full` adds stats/analysis/audit + a tree-sitter symbol map.
