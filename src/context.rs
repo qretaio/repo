@@ -1041,7 +1041,7 @@ fn gather_symbols(base: &Path) -> String {
     let mut total = 0usize;
     const CAP: usize = 400;
 
-    for rel in crate::search::index::list_source_files(base) {
+    for rel in crate::search::discovery::list_source_files(base) {
         if language_for_path(std::path::Path::new(&rel)).is_none() {
             continue;
         }

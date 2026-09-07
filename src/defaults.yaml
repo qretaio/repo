@@ -350,3 +350,17 @@ semantic:
   bm25_candidates: 50
   dense_candidates: 50
   rerank_topn: 10
+  # Rerank relevance cutoff. Candidates above it lead the results; rejected
+  # ones only backfill remaining slots in fused order (so a strict reranker
+  # can't erase hits BM25 and dense both surfaced). Lower (or negative) to
+  # trust negative rerank scores as relevant.
+  rerank_threshold: 0.0
+
+# Local telemetry. Every search, index build, and eval run appends one JSON
+# line to ~/.cache/repo/metrics/<repo>.jsonl; `repo metrics` aggregates it and
+# `repo eval` links its reports. The log never leaves the machine. Set
+# `enabled: false` to record nothing, or `log_queries: false` to store a query
+# hash instead of the raw text.
+observability:
+  enabled: true
+  log_queries: true

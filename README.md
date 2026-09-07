@@ -7,7 +7,7 @@ multiple programming languages, with auto-detection.
 
 - **Auto-detection**: detects project types (Node.js, Python, Rust, Go, JVM)
 - **Cross-language commands**: `lint`, `fmt`, `build`, `test` work across all detected projects
-- **Context gathering**: `context` (Phase 2 — currently stubbed)
+- **Context gathering**: `context` — AI-ready repo overview (git, structure, symbols, TODOs, optional analysis/audit)
 - **Mix**: pack a repo into one AI-friendly file via `repomix`
 
 ## Usage
@@ -31,6 +31,42 @@ repo test --watch      # watch mode (if supported)
 
 repo mix               # repomix passthrough
 ```
+
+## Search
+
+`repo index` / `repo search` build and query a local, definition-aware code index:
+
+- File discovery respects `.gitignore`/`.ignore` rules, skips hidden entries, and
+  caps file size at 1 MiB (the `ignore` walker — no `rg` subprocess). The same
+  walker feeds the search index, the symbol store, and `context`.
+- Chunks are definition-aligned (tree-sitter): one chunk per top-level symbol,
+  with the symbol breadcrumb ranked into the token stream. Languages without a
+  grammar fall back to overlapping line windows.
+- Indexing is incremental: an mtime diff re-chunks and re-embeds only changed,
+  added, or removed files. `repo index --force` rebuilds from scratch.
+- Retrieval fuses BM25 and dense embeddings (local llama.cpp) with reciprocal
+  rank fusion, then cross-encoder reranks. `--lang` / `--path` filter inside
+  both stages. `--bm25` forces lexical-only; semantic mode hard-fails when its
+  local server is unreachable — never a silent fallback.
+
+## Evaluation & telemetry
+
+Retrieval quality and behavior are measurable and reviewable out of the box:
+
+- `repo eval` — runs the golden queries in `eval.yaml` (this repo ships one)
+  through both retrieval modes and reports recall@k, MRR, nDCG@k, and latency
+  percentiles per mode. Full reports persist under `~/.cache/repo/evals/`;
+  `repo eval --init` writes a starter spec for another repository.
+- `repo metrics` — aggregates the local JSONL telemetry log
+  (`~/.cache/repo/metrics/`): per-mode query counts and latency percentiles,
+  zero-result queries, rerank fallbacks, errors, index-build history, and
+  eval trends. `--tail N` shows raw events; `--json` emits the summary.
+- `repo search -v` prints each query's stage trace (bm25 / embed / dense /
+  rerank timings and candidate counts).
+
+Recording is local-only and on by default; disable with
+`observability.enabled: false` in repo.yaml (or `log_queries: false` to keep
+only a query hash). Logs rotate at 10 MB.
 
 ## MCP server
 

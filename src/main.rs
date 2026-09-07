@@ -8,15 +8,16 @@ mod commands;
 mod context;
 mod detect;
 mod mcp;
+mod observe;
 mod run;
 mod search;
 mod symbols;
 mod tasks;
 
 use commands::{
-    build::BuildArgs, context::ContextArgs, fmt::FmtArgs, index::IndexArgs, lint::LintArgs,
-    mcp::McpArgs, mix::MixArgs, refs::RefsArgs, run::RunArgs, search::SearchArgs,
-    symbols::SymbolsArgs, test::TestArgs,
+    build::BuildArgs, context::ContextArgs, eval::EvalArgs, fmt::FmtArgs, index::IndexArgs,
+    lint::LintArgs, mcp::McpArgs, metrics::MetricsArgs, mix::MixArgs, refs::RefsArgs, run::RunArgs,
+    search::SearchArgs, symbols::SymbolsArgs, test::TestArgs,
 };
 use detect::Detector;
 
@@ -148,6 +149,23 @@ enum Cmd {
     /// auto-builds on first use).
     Symbols(SymbolsArgs),
 
+    /// Evaluate retrieval quality against a golden-query spec.
+    ///
+    /// Runs each query in `eval.yaml` through the BM25 and hybrid semantic
+    /// pipelines and reports recall@k, MRR, nDCG@k, and latency percentiles
+    /// per mode. Full reports are saved under `~/.cache/repo/evals/` and
+    /// summarized in the metrics log, so runs are comparable over time.
+    /// `repo eval --init` writes a starter spec.
+    Eval(EvalArgs),
+
+    /// Show aggregated search/build/eval telemetry for this repository.
+    ///
+    /// Summarizes the local JSONL event log (`~/.cache/repo/metrics/`):
+    /// per-mode query counts and latency percentiles, zero-result queries,
+    /// rerank fallbacks, errors, index-build history, and eval trends.
+    /// `--tail N` prints raw events; `--json` emits the summary as JSON.
+    Metrics(MetricsArgs),
+
     /// Run as an MCP server over stdio.
     ///
     /// Exposes context/search/refs/task as MCP tools for AI agents. Configure
@@ -188,6 +206,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Search(a) => commands::search::run(&detector, &globals, &a),
         Cmd::Refs(a) => commands::refs::run(&detector, &globals, &a),
         Cmd::Symbols(a) => commands::symbols::run(&detector, &globals, &a),
+        Cmd::Eval(a) => commands::eval::run(&detector, &globals, &a),
+        Cmd::Metrics(a) => commands::metrics::run(&detector, &globals, &a),
         Cmd::Mcp(a) => commands::mcp::run(&detector, &globals, &a),
     };
 

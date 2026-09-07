@@ -1,20 +1,28 @@
-//! Phase 5 — semantic search: 3-stage hybrid retrieval.
+//! Phase 5 — semantic search: 3-stage hybrid retrieval with RRF fusion.
 //!
 //! Stage 1: BM25 (Tantivy) — lexical candidates.
 //! Stage 2: dense — query embedding vs stored chunk embeddings (cosine).
-//! Stage 3: cross-encoder rerank — `/v1/rerank` over the union of (1) + (2).
+//! Fusion: the two ranked lists merge via reciprocal rank fusion (RRF, k=60).
+//! Raw BM25 and cosine scores aren't comparable; ranks are (the fusion lesson
+//! from zvec-grep's pipeline).
+//! Stage 3: cross-encoder rerank — `/v1/rerank` over the fused candidates.
+//! When the reranker scores every candidate irrelevant (≤ 0) the fused
+//! ranking stands rather than returning nothing.
 //!
-//! Inference is externalized to the local llama-swap gateway (:8282,
-//! LaunchAgent `com.mostlygeek.llama-swap` — starts at login, KeepAlive) —
-//! no bundled ONNX, no model weights, no API key. Storage is a sidecar
-//! `vectors.db` beside the BM25 index: every chunk
-//! is embedded at index time and cached there.
+//! Inference is externalized to a local llama.cpp server — defaults
+//! `:8081/v1/embeddings` (model `bge-small`) and `:8082/v1/rerank` (model
+//! `bge-reranker`), configurable via the `semantic:` section of repo.yaml.
+//! Storage is a sidecar `vectors.db` beside the BM25 index: every chunk is
+//! embedded at index time and cached there. Updates are incremental — the
+//! manifest's per-file mtime map is diffed against a fresh walk and only the
+//! delta is re-embedded; a full re-embed happens on `--force`, model or
+//! schema changes, or when more than half the tree moved.
 //!
 //! Contract: semantic is **on by default** (`semantic.enabled: true` in the
 //! embedded defaults). OFF → pure BM25, never touches the network. ON → the
-//! gateway MUST be reachable at index/query time; unreachable is a
-//! hard error, **never** a silent BM25 fallback. `repo search --bm25`
-//! overrides per-invocation.
+//! server MUST be reachable at index/query time; unreachable is a hard error,
+//! **never** a silent BM25 fallback. `repo search --bm25` overrides
+//! per-invocation.
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use rusqlite::{params, Connection};
@@ -22,11 +30,16 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::search::chunker::chunks;
+use crate::search::chunker::chunks_for;
+use crate::search::discovery;
 use crate::search::index::{BuildStats, Hit};
+use crate::search::trace::SearchTrace;
 
-const SEMANTIC_VERSION: u32 = 1;
+const SEMANTIC_VERSION: u32 = 2;
 const EMBED_BATCH: usize = 16;
+/// Standard RRF constant: dampens the head of the ranking so a #1 from one
+/// list can't drown ten strong hits from the other.
+const RRF_K: f32 = 60.0;
 
 // ---------------------------------------------------------------------------
 // settings
@@ -45,6 +58,22 @@ pub struct SemanticSettings {
     pub bm25_candidates: usize,
     pub dense_candidates: usize,
     pub rerank_topn: usize,
+    /// Rerank relevance cutoff: candidates above it are "relevant" and come
+    /// first; the rest only backfill remaining slots (in fused order).
+    /// Lower it to trust negative rerank scores as relevant too.
+    pub rerank_threshold: f32,
+}
+
+impl SemanticSettings {
+    /// Which pipeline [`search`] runs with these settings (used for
+    /// telemetry on failed queries, where no trace comes back).
+    pub fn mode_name(&self) -> &'static str {
+        if self.enabled {
+            "semantic"
+        } else {
+            "bm25"
+        }
+    }
 }
 
 impl Default for SemanticSettings {
@@ -59,6 +88,7 @@ impl Default for SemanticSettings {
             bm25_candidates: 50,
             dense_candidates: 50,
             rerank_topn: 10,
+            rerank_threshold: 0.0,
         }
     }
 }
@@ -75,6 +105,7 @@ struct SemanticRaw {
     bm25_candidates: Option<usize>,
     dense_candidates: Option<usize>,
     rerank_topn: Option<usize>,
+    rerank_threshold: Option<f32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -140,6 +171,9 @@ fn apply(settings: &mut SemanticSettings, raw: Option<SemanticRaw>) {
     if let Some(v) = raw.rerank_topn.filter(|&s| s > 0) {
         settings.rerank_topn = v;
     }
+    if let Some(v) = raw.rerank_threshold {
+        settings.rerank_threshold = v;
+    }
 }
 
 fn global_config_dir() -> Option<PathBuf> {
@@ -162,6 +196,8 @@ fn global_config_dir() -> Option<PathBuf> {
 #[derive(Serialize, Deserialize)]
 struct SemanticMeta {
     schema_version: u32,
+    /// Canonical root — matches how the BM25 index keys its cache dir, so a
+    /// symlinked invocation doesn't look perpetually stale.
     root: String,
     files: std::collections::HashMap<String, u64>,
     model: String,
@@ -172,39 +208,32 @@ fn vectors_path(root: &Path) -> Option<PathBuf> {
     crate::search::index::index_dir(root).map(|d| d.join("vectors.db"))
 }
 
-/// True when the sidecar store is missing, for another model, or any tracked
-/// file's mtime changed since the last embed.
-pub fn is_stale(root: &Path, model: &str) -> bool {
-    let Some(path) = vectors_path(root) else {
-        return true;
-    };
-    let Ok(conn) = Connection::open(&path) else {
-        return true;
-    };
-    let Ok(meta_json): Result<String, _> =
-        conn.query_row("SELECT value FROM meta WHERE key='semantic'", [], |r| {
+fn canonical_root(root: &Path) -> String {
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    canon.to_string_lossy().into_owned()
+}
+
+fn load_meta(conn: &Connection) -> Option<SemanticMeta> {
+    let meta_json: String = conn
+        .query_row("SELECT value FROM meta WHERE key='semantic'", [], |r| {
             r.get(0)
         })
-    else {
-        return true;
+        .ok()?;
+    serde_json::from_str(&meta_json).ok()
+}
+
+fn write_meta(conn: &Connection, root: &Path, files: &[(String, u64)], model: &str) -> Result<()> {
+    let meta = SemanticMeta {
+        schema_version: SEMANTIC_VERSION,
+        root: canonical_root(root),
+        files: files.iter().cloned().collect(),
+        model: model.to_string(),
     };
-    let Ok(meta) = serde_json::from_str::<SemanticMeta>(&meta_json) else {
-        return true;
-    };
-    if meta.schema_version != SEMANTIC_VERSION || meta.model != model {
-        return true;
-    }
-    let current = crate::search::index::source_files(root);
-    if current.len() != meta.files.len() {
-        return true;
-    }
-    for (rel, mtime) in current {
-        match meta.files.get(&rel) {
-            Some(stored) if *stored == mtime => {}
-            _ => return true,
-        }
-    }
-    false
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('semantic', ?1)",
+        params![serde_json::to_string(&meta)?],
+    )?;
+    Ok(())
 }
 
 fn open_vectors(root: &Path) -> Result<Connection> {
@@ -231,91 +260,129 @@ fn open_vectors(root: &Path) -> Result<Connection> {
 }
 
 /// Number of chunks currently stored in the sidecar DB (for "up to date" messages).
-fn stored_chunks(root: &Path) -> Option<usize> {
-    let path = vectors_path(root)?;
-    let conn = Connection::open(&path).ok()?;
+fn stored_chunks(conn: &Connection) -> usize {
     conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| {
         r.get::<_, i64>(0).map(|n| n as usize)
     })
-    .ok()
+    .unwrap_or(0)
 }
 
-/// Build (or refresh) the sidecar vector store: embed every chunk of every
-/// tracked source file into `vectors.db`. Rebuilds when stale/forced; a model
-/// change is detected via [`is_stale`]. Reuses the BM25 index's chunking, so
-/// the two stages cover exactly the same chunks.
+/// Build (or refresh) the sidecar vector store, recording a telemetry event
+/// (see [`crate::observe`]). See [`build_impl`] for the refresh policy.
 pub fn build(root: &Path, settings: &SemanticSettings, force: bool) -> Result<BuildStats> {
+    let t0 = std::time::Instant::now();
+    let result = build_impl(root, settings, force);
+    crate::observe::record_build(root, "semantic", &result, t0.elapsed());
+    result
+}
+
+/// Embed every chunk of every tracked source file into `vectors.db`.
+/// Incremental when a compatible meta exists and the delta is small; full
+/// re-embed when `force`, on model or schema changes, or when more than half
+/// the tree moved. Reuses the BM25 index's chunking, so the two stages cover
+/// exactly the same chunks.
+fn build_impl(root: &Path, settings: &SemanticSettings, force: bool) -> Result<BuildStats> {
     if !settings.enabled {
         return Ok(BuildStats {
             files: 0,
             chunks: 0,
             rebuilt: false,
+            incremental: false,
         });
     }
-    if !force && !is_stale(root, &settings.embed_model) {
-        let chunks = stored_chunks(root).unwrap_or(0);
-        return Ok(BuildStats {
-            files: 0,
-            chunks,
-            rebuilt: false,
-        });
-    }
-
-    let files = crate::search::index::source_files(root);
+    let files = discovery::source_files(root);
     if files.is_empty() {
         bail!("no indexable source files found under {}", root.display());
     }
 
     let conn = open_vectors(root)?;
-    conn.execute_batch("DELETE FROM chunks; DELETE FROM meta;")?;
+    let meta = load_meta(&conn);
+    let compatible = meta.as_ref().is_some_and(|m| {
+        m.schema_version == SEMANTIC_VERSION
+            && m.model == settings.embed_model
+            && m.root == canonical_root(root)
+    });
 
-    let mut total_chunks = 0usize;
-    for (rel, _mtime) in &files {
-        let abs = root.join(rel);
-        let Ok(text) = std::fs::read_to_string(&abs) else {
-            continue;
-        };
-        let Some(lang) = crate::search::index::lang_for(&abs) else {
-            continue;
-        };
-        let file_chunks = chunks(&text);
-        let texts: Vec<&str> = file_chunks.iter().map(|c| c.text.as_str()).collect();
-        let vectors = embed_texts(&texts, settings)?;
-        for (c, vector) in file_chunks.iter().zip(vectors) {
-            let chunk_id = format!("{rel}:{}-{}", c.start, c.end);
-            conn.execute(
-                "INSERT INTO chunks (chunk_id, path, start, end, lang, source, vector)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    chunk_id,
-                    rel,
-                    c.start as i64,
-                    c.end as i64,
-                    lang,
-                    c.text,
-                    encode(&vector),
-                ],
-            )?;
-            total_chunks += 1;
+    if !force && compatible {
+        let meta = meta.as_ref().expect("checked above");
+        let diff = discovery::diff_files(&files, &meta.files);
+        if diff.is_empty() {
+            return Ok(BuildStats {
+                files: files.len(),
+                chunks: stored_chunks(&conn),
+                rebuilt: false,
+                incremental: false,
+            });
+        }
+        if diff.total() * 2 <= files.len() {
+            for rel in diff.removed.iter().chain(&diff.changed) {
+                conn.execute("DELETE FROM chunks WHERE path = ?1", params![rel])?;
+            }
+            let mut embedded = 0usize;
+            for rel in diff.added.iter().chain(&diff.changed) {
+                embedded += embed_file(&conn, root, rel, settings)?;
+            }
+            write_meta(&conn, root, &files, &settings.embed_model)?;
+            return Ok(BuildStats {
+                files: files.len(),
+                chunks: embedded,
+                rebuilt: true,
+                incremental: true,
+            });
         }
     }
 
-    let meta = SemanticMeta {
-        schema_version: SEMANTIC_VERSION,
-        root: root.to_string_lossy().into_owned(),
-        files: files.into_iter().collect(),
-        model: settings.embed_model.clone(),
-    };
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('semantic', ?1)",
-        params![serde_json::to_string(&meta)?],
-    )?;
+    // Full (re)embed: no usable meta, forced, or too much of the tree moved.
+    conn.execute_batch("DELETE FROM chunks; DELETE FROM meta;")?;
+    let mut total_chunks = 0usize;
+    for (rel, _mtime) in &files {
+        total_chunks += embed_file(&conn, root, rel, settings)?;
+    }
+    write_meta(&conn, root, &files, &settings.embed_model)?;
 
     Ok(BuildStats {
-        files: meta.files.len(),
+        files: files.len(),
         chunks: total_chunks,
         rebuilt: true,
+        incremental: false,
     })
+}
+
+/// Chunk `rel` and embed its chunks into the sidecar DB. Returns the chunk
+/// count embedded.
+fn embed_file(
+    conn: &Connection,
+    root: &Path,
+    rel: &str,
+    settings: &SemanticSettings,
+) -> Result<usize> {
+    let abs = root.join(rel);
+    let Ok(text) = std::fs::read_to_string(&abs) else {
+        return Ok(0);
+    };
+    let Some(lang) = discovery::lang_for(&abs) else {
+        return Ok(0);
+    };
+    let file_chunks = chunks_for(&text, &abs);
+    let texts: Vec<&str> = file_chunks.iter().map(|c| c.text.as_str()).collect();
+    let vectors = embed_texts(&texts, settings)?;
+    for (c, vector) in file_chunks.iter().zip(vectors) {
+        let chunk_id = format!("{rel}:{}-{}", c.start, c.end);
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks (chunk_id, path, start, end, lang, source, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chunk_id,
+                rel,
+                c.start as i64,
+                c.end as i64,
+                lang,
+                c.text,
+                encode(&vector),
+            ],
+        )?;
+    }
+    Ok(file_chunks.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -440,8 +507,10 @@ fn encode(v: &[f32]) -> Vec<u8> {
 }
 
 fn decode(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -570,84 +639,230 @@ fn post_json(
 // search
 // ---------------------------------------------------------------------------
 
-/// Run a semantic (hybrid) search: BM25 ∪ dense → rerank → top-K.
+/// Run a semantic (hybrid) search: BM25 ∪ dense → RRF fusion → rerank → top-K.
 ///
-/// `limit` is the final result cap (defaults to `rerank_topn` when 0). When
-/// semantic is disabled this is pure BM25 (no network).
+/// `limit` is the final result cap (defaults to `rerank_topn` when 0). `lang`
+/// and `path_filter` are applied inside both stages. When semantic is
+/// disabled this is pure BM25 (no network). Returns hits plus a
+/// [`SearchTrace`] with stage timings and candidate counts.
 pub fn search(
     root: &Path,
     query: &str,
     settings: &SemanticSettings,
     limit: usize,
-) -> Result<Vec<Hit>> {
+    lang: Option<&str>,
+    path_filter: Option<&str>,
+) -> Result<(Vec<Hit>, SearchTrace)> {
     if !settings.enabled {
-        return crate::search::index::search(root, query, limit, None, None);
+        let t = std::time::Instant::now();
+        let hits = crate::search::index::search(root, query, limit, lang, path_filter);
+        let trace = SearchTrace {
+            mode: "bm25",
+            bm25_ms: Some(t.elapsed().as_millis() as u64),
+            bm25_candidates: hits.as_ref().map(Vec::len).ok(),
+            ..Default::default()
+        };
+        return hits.map(|h| (h, trace));
     }
 
     // Stage 1: BM25 candidates (reuses the Tantivy index — same chunks).
+    let t = std::time::Instant::now();
     let bm25_hits =
-        crate::search::index::search(root, query, settings.bm25_candidates, None, None)?;
+        crate::search::index::search(root, query, settings.bm25_candidates, lang, path_filter)?;
+    let bm25_ms = t.elapsed().as_millis() as u64;
+    let bm25_candidates = bm25_hits.len();
 
-    // Stage 2: dense candidates.
-    let dense_hits = dense_search(root, query, settings)?;
-
-    // Union, dedup by (path, start), keeping the higher score.
-    let mut candidates = Vec::with_capacity(bm25_hits.len() + dense_hits.len());
-    candidates.extend(bm25_hits);
-    for h in dense_hits {
-        let dup = candidates
-            .iter()
-            .position(|c: &Hit| c.path == h.path && c.start == h.start);
-        match dup {
-            Some(i) if candidates[i].score < h.score => candidates[i] = h,
-            Some(_) => {}
-            None => candidates.push(h),
-        }
+    // Stage 2: dense candidates (query embedding + cosine scan).
+    let t = std::time::Instant::now();
+    let qv = embed_query(query, settings)?;
+    let embed_ms = t.elapsed().as_millis() as u64;
+    let t = std::time::Instant::now();
+    let dense_hits = dense_scan(&qv, root, settings, lang, path_filter)?;
+    let dense_ms = t.elapsed().as_millis() as u64;
+    let dense_candidates = dense_hits.len();
+    if bm25_hits.is_empty() && dense_hits.is_empty() {
+        return Ok((
+            Vec::new(),
+            SearchTrace {
+                mode: "semantic",
+                total_ms: None,
+                bm25_ms: Some(bm25_ms),
+                embed_ms: Some(embed_ms),
+                dense_ms: Some(dense_ms),
+                bm25_candidates: Some(bm25_candidates),
+                dense_candidates: Some(dense_candidates),
+                ..Default::default()
+            },
+        ));
     }
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
 
-    // Stage 3: rerank the union.
+    // Fuse the two ranked lists with reciprocal rank fusion — each list votes
+    // 1/(k + rank + 1) per candidate; a candidate's fused score is its vote
+    // sum. Duplicates (same chunk from both lists) pool their votes.
+    let mut fused: Vec<(Hit, f32)> = Vec::with_capacity(bm25_candidates + dense_candidates);
+    for (rank, hit) in bm25_hits.into_iter().enumerate() {
+        rrf_vote(&mut fused, hit, rank);
+    }
+    for (rank, hit) in dense_hits.into_iter().enumerate() {
+        rrf_vote(&mut fused, hit, rank);
+    }
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let candidates: Vec<Hit> = fused.iter().map(|(h, _)| h.clone()).collect();
+    let fused_candidates = candidates.len();
+
+    // Stage 3: rerank the fused candidates.
     let docs: Vec<RerankDoc> = candidates
         .iter()
         .map(|h| rerank_doc(&h.source, h.start, query, 10))
         .collect();
+    let t = std::time::Instant::now();
     let scores = rerank(query, &docs, settings)?;
+    let rerank_ms = t.elapsed().as_millis() as u64;
 
-    let mut ranked: Vec<(usize, f32)> = scores
-        .iter()
-        .enumerate()
-        .filter(|&(_, &s)| s > 0.0)
-        .map(|(i, &s)| (i, s))
-        .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let topn = if limit == 0 {
         settings.rerank_topn
     } else {
         limit.min(settings.rerank_topn)
     };
-    ranked.truncate(topn);
+    let picked = select_topn(&scores, candidates.len(), settings.rerank_threshold, topn);
+    if picked.is_empty() {
+        return Ok((
+            Vec::new(),
+            SearchTrace {
+                mode: "semantic",
+                total_ms: None,
+                bm25_ms: Some(bm25_ms),
+                embed_ms: Some(embed_ms),
+                dense_ms: Some(dense_ms),
+                rerank_ms: Some(rerank_ms),
+                bm25_candidates: Some(bm25_candidates),
+                dense_candidates: Some(dense_candidates),
+                fused_candidates: Some(fused_candidates),
+                rerank_survivors: Some(0),
+                rerank_filled: Some(0),
+                fallback: false,
+            },
+        ));
+    }
+    let survivors = scores
+        .iter()
+        .filter(|&&s| s > settings.rerank_threshold)
+        .count();
+    let filled = picked
+        .iter()
+        .filter(|&&i| scores[i] <= settings.rerank_threshold)
+        .count();
 
-    Ok(ranked
+    let hits = picked
         .into_iter()
-        .map(|(i, score)| Hit {
-            path: candidates[i].path.clone(),
-            start: docs[i].start,
-            end: docs[i].start + docs[i].text.lines().count() as u64 - 1,
-            lang: candidates[i].lang.clone(),
-            score,
-            source: docs[i].text.clone(),
+        .map(|i| {
+            // Unscored candidates (rerank response gaps default to f32::MIN)
+            // surface as 0 rather than an absurd negative.
+            let score = if scores[i] == f32::MIN {
+                0.0
+            } else {
+                scores[i]
+            };
+            Hit {
+                path: candidates[i].path.clone(),
+                start: docs[i].start,
+                end: docs[i].start + docs[i].text.lines().count() as u64 - 1,
+                lang: candidates[i].lang.clone(),
+                score,
+                source: docs[i].text.clone(),
+            }
         })
-        .collect())
+        .collect();
+    Ok((
+        hits,
+        SearchTrace {
+            mode: "semantic",
+            total_ms: None,
+            bm25_ms: Some(bm25_ms),
+            embed_ms: Some(embed_ms),
+            dense_ms: Some(dense_ms),
+            rerank_ms: Some(rerank_ms),
+            bm25_candidates: Some(bm25_candidates),
+            dense_candidates: Some(dense_candidates),
+            fused_candidates: Some(fused_candidates),
+            rerank_survivors: Some(survivors),
+            rerank_filled: Some(filled),
+            fallback: survivors == 0,
+        },
+    ))
+}
+
+/// Choose the final result set from rerank `scores` over the fused candidate
+/// pool: rerank scores above `threshold` first (descending), then backfill in
+/// fused order so a strict reranker can't crater recall — its *ordering*
+/// stays authoritative, but a low absolute score no longer erases a candidate
+/// the BM25 and dense stages both surfaced (the 2026-09-07 eval finding).
+/// Returns candidate indices in output order, capped at `topn`.
+fn select_topn(scores: &[f32], len: usize, threshold: f32, topn: usize) -> Vec<usize> {
+    let mut rerank_order: Vec<usize> = (0..len).collect();
+    rerank_order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut picked: Vec<usize> = rerank_order
+        .into_iter()
+        .filter(|&i| scores[i] > threshold)
+        .take(topn)
+        .collect();
+    // Backfill from the fused order (candidates are fused-sorted by index).
+    for i in 0..len {
+        if picked.len() >= topn {
+            break;
+        }
+        if !picked.contains(&i) {
+            picked.push(i);
+        }
+    }
+    picked
+}
+
+/// Cast one list's vote for `hit` at 0-based `rank` into the fused pool,
+/// keyed by chunk identity (path + start line).
+fn rrf_vote(fused: &mut Vec<(Hit, f32)>, hit: Hit, rank: usize) {
+    let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
+    match fused
+        .iter_mut()
+        .find(|(h, _)| h.path == hit.path && h.start == hit.start)
+    {
+        Some((_, score)) => *score += contribution,
+        None => fused.push((hit, contribution)),
+    }
 }
 
 /// Dense stage: embed the query, cosine against every stored chunk, top-K.
-fn dense_search(root: &Path, query: &str, settings: &SemanticSettings) -> Result<Vec<Hit>> {
-    let qv = embed_query(query, settings)?;
+/// `lang`/`path_filter` filter rows in SQL so no candidate is fetched just to
+/// be discarded.
+/// Dense scan: cosine the (already embedded) query vector against every
+/// stored chunk, top-K. `lang`/`path_filter` filter rows in SQL so no
+/// candidate is fetched just to be discarded.
+fn dense_scan(
+    qv: &[f32],
+    root: &Path,
+    settings: &SemanticSettings,
+    lang: Option<&str>,
+    path_filter: Option<&str>,
+) -> Result<Vec<Hit>> {
     let conn = open_vectors(root)?;
-    let mut stmt = conn.prepare("SELECT path, start, end, lang, source, vector FROM chunks")?;
-    let rows = stmt.query_map([], |r| {
+    let mut sql =
+        String::from("SELECT path, start, end, lang, source, vector FROM chunks WHERE 1=1");
+    let mut args: Vec<String> = Vec::new();
+    if let Some(want) = lang {
+        sql.push_str(" AND lang = ?");
+        args.push(want.to_ascii_lowercase());
+    }
+    if let Some(needle) = path_filter {
+        sql.push_str(" AND path LIKE ? ESCAPE '\\'");
+        args.push(format!("%{}%", escape_like(needle)));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)? as u64,
@@ -661,7 +876,7 @@ fn dense_search(root: &Path, query: &str, settings: &SemanticSettings) -> Result
     let mut scored: Vec<(f32, Hit)> = Vec::new();
     for row in rows {
         let (path, start, end, lang, source, vector) = row?;
-        let score = cosine(&qv, &vector);
+        let score = cosine(qv, &vector);
         if score > 0.0 {
             scored.push((
                 score,
@@ -679,6 +894,18 @@ fn dense_search(root: &Path, query: &str, settings: &SemanticSettings) -> Result
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(settings.dense_candidates);
     Ok(scored.into_iter().map(|(_, h)| h).collect())
+}
+
+/// Escape SQL LIKE metacharacters so a path filter is a literal substring.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn embed_query(query: &str, settings: &SemanticSettings) -> Result<Vec<f32>> {
@@ -730,7 +957,7 @@ mod tests {
     fn rerank_doc_windows_around_term() {
         let src = "line0\nline1\nfoo bar\nline3\nline4\nline5\n";
         let doc = rerank_doc(src, 10, "bar", 1);
-        assert_eq!(doc.start, 11); // 10 + index of "foo bar" (1) - ctx(1) → wait
+        assert_eq!(doc.start, 11);
         assert!(doc.text.contains("foo bar"));
     }
 
@@ -752,5 +979,71 @@ mod tests {
             absolute_url("http://127.0.0.1:8081/x"),
             "http://127.0.0.1:8081/x"
         );
+    }
+
+    fn hit(path: &str, start: u64) -> Hit {
+        Hit {
+            path: path.to_string(),
+            start,
+            end: start,
+            lang: "rust".into(),
+            score: 1.0,
+            source: String::new(),
+        }
+    }
+
+    #[test]
+    fn rrf_vote_pools_duplicates_and_dampens_by_rank() {
+        let mut fused: Vec<(Hit, f32)> = Vec::new();
+        rrf_vote(&mut fused, hit("a.rs", 1), 0);
+        // Same chunk via the other list → votes pool.
+        rrf_vote(&mut fused, hit("a.rs", 1), 3);
+        rrf_vote(&mut fused, hit("b.rs", 1), 1);
+
+        let score_of = |p: &str| fused.iter().find(|(h, _)| h.path == p).unwrap().1;
+        // a.rs: 1/61 (rank 0) + 1/64 (rank 3) beats b.rs: 1/62 (rank 1)…
+        assert!((score_of("a.rs") - (1.0 / 61.0 + 1.0 / 64.0)).abs() < 1e-6);
+        // …but not by much: RRF keeps the lists comparably weighted.
+        assert!(score_of("a.rs") > score_of("b.rs"));
+        assert_eq!(fused.len(), 2, "duplicates pool into one entry");
+    }
+
+    #[test]
+    fn escape_like_treats_metacharacters_literally() {
+        assert_eq!(escape_like("src/main.rs"), "src/main.rs");
+        assert_eq!(escape_like("50%_done"), "50\\%\\_done");
+        assert_eq!(escape_like("back\\slash"), "back\\\\slash");
+    }
+
+    #[test]
+    fn select_topn_survivors_first_then_fused_backfill() {
+        let scores = [0.9, -1.0, 0.5, f32::MIN];
+        // Survivors 0 (0.9) and 2 (0.5) lead in rerank order; the rejected
+        // 1 and unscored 3 backfill in fused order.
+        assert_eq!(select_topn(&scores, 4, 0.0, 4), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn select_topn_all_rejected_keeps_fused_order() {
+        let scores = [-1.0, -2.0, -0.5];
+        assert_eq!(select_topn(&scores, 3, 0.0, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_topn_caps_at_topn() {
+        let scores = [0.9, -1.0, 0.5];
+        assert_eq!(select_topn(&scores, 3, 0.0, 2), vec![0, 2]);
+    }
+
+    #[test]
+    fn select_topn_negative_threshold_trusts_negatives() {
+        let scores = [0.9, -1.0, -0.5];
+        // With the cutoff at -2 every candidate survives, in rerank order.
+        assert_eq!(select_topn(&scores, 3, -2.0, 3), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn select_topn_empty_pool_yields_nothing() {
+        assert!(select_topn(&[], 0, 0.0, 5).is_empty());
     }
 }

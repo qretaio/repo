@@ -1,10 +1,12 @@
 pub mod build;
 pub mod common;
 pub mod context;
+pub mod eval;
 pub mod fmt;
 pub mod index;
 pub mod lint;
 pub mod mcp;
+pub mod metrics;
 pub mod mix;
 pub mod refs;
 pub mod run;

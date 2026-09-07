@@ -1,9 +1,10 @@
 //! Search command — ranked code search across the repository.
 //!
 //! Pure BM25 (`repo search --bm25`, or when semantic is disabled in config)
-//! or 3-stage hybrid retrieval (BM25 ∪ dense → cross-encoder rerank) via
-//! local llama.cpp when semantic is enabled (the default). Semantic ON:
-//! unreachable servers are a hard error — never a silent BM25 fallback.
+//! or 3-stage hybrid retrieval (BM25 ∪ dense → RRF fusion → cross-encoder
+//! rerank) via local llama.cpp when semantic is enabled (the default).
+//! Semantic ON: unreachable servers are a hard error — never a silent BM25
+//! fallback.
 
 use clap::Args;
 use colored::Colorize;
@@ -22,11 +23,11 @@ pub struct SearchArgs {
     #[arg(short, long, default_value = "10")]
     pub limit: usize,
 
-    /// Filter results by language (rust, python, go, typescript, …). BM25-only.
+    /// Filter results by language (rust, python, go, typescript, …).
     #[arg(long)]
     pub lang: Option<String>,
 
-    /// Filter results by file-path substring. BM25-only.
+    /// Filter results by file-path substring.
     #[arg(long)]
     pub path: Option<String>,
 
@@ -43,7 +44,7 @@ pub struct SearchArgs {
     pub bm25: bool,
 }
 
-pub fn run(_detector: &Detector, _globals: &Globals, args: &SearchArgs) -> i32 {
+pub fn run(_detector: &Detector, globals: &Globals, args: &SearchArgs) -> i32 {
     let root = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => {
@@ -62,45 +63,49 @@ pub fn run(_detector: &Detector, _globals: &Globals, args: &SearchArgs) -> i32 {
 
     let semantic_on = settings.enabled && !args.bm25;
 
-    // Ensure the BM25 index exists (semantic builds re-embed only when stale).
+    // Ensure the BM25 index exists (build is a no-op when current; a stale
+    // manifest refreshes incrementally instead of rebuilding from scratch).
     if search::index::is_stale(&root) || !index_exists(&root) {
-        eprintln!("{}", "Building index…".cyan());
-        if let Err(e) = search::index::build(&root, true) {
+        eprintln!("{}", "Updating index…".cyan());
+        if let Err(e) = search::index::build(&root, false) {
             eprintln!("{}", format!("Error: {e}").red());
             return 1;
         }
     }
 
-    let hits = if semantic_on {
-        match search::semantic::build(&root, &settings, false) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("{}", format!("Error building semantic index: {e}").red());
-                return 1;
-            }
+    if semantic_on {
+        if let Err(e) = search::semantic::build(&root, &settings, false) {
+            eprintln!("{}", format!("Error building semantic index: {e}").red());
+            return 1;
         }
-        match search::semantic::search(&root, &args.query, &settings, args.limit) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("{}", format!("Error: {e}").red());
-                return 1;
-            }
-        }
-    } else {
-        match search::index::search(
-            &root,
-            &args.query,
-            args.limit,
-            args.lang.as_deref(),
-            args.path.as_deref(),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("{}", format!("Error: {e}").red());
-                return 1;
-            }
+    }
+
+    let outcome = match search::run_query(
+        search::QueryRequest {
+            root: &root,
+            query: &args.query,
+            limit: args.limit,
+            lang: args.lang.as_deref(),
+            path_filter: args.path.as_deref(),
+            force_bm25: args.bm25,
+            source: "cli",
+        },
+        &settings,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{}", format!("Error: {e}").red());
+            return 1;
         }
     };
+    let hits = outcome.hits;
+
+    if globals.verbose && !args.json {
+        println!(
+            "{}",
+            format!("trace: {}", outcome.trace.summary()).bright_black()
+        );
+    }
 
     if hits.is_empty() {
         if !args.json {

@@ -8,7 +8,8 @@
 use super::lang::language_for_path;
 use super::parse;
 use super::{DefKind, Definition, ImportEdge};
-use crate::search::index::{fnv1a64, source_files};
+use crate::search::discovery::source_files;
+use crate::search::index::fnv1a64;
 use anyhow::{Context as _, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;

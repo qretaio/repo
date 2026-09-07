@@ -77,10 +77,10 @@ pub struct SearchParams {
     /// Maximum number of results.
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Filter results by language (rust, python, go, typescript, …). BM25-only.
+    /// Filter results by language (rust, python, go, typescript, …).
     #[serde(default)]
     pub lang: Option<String>,
-    /// Filter results by file-path substring. BM25-only.
+    /// Filter results by file-path substring.
     #[serde(default)]
     pub path: Option<String>,
     /// Force pure BM25 (skip semantic retrieval regardless of config).
@@ -171,27 +171,32 @@ pub fn context(root: PathBuf, p: ContextParams) -> anyhow::Result<CallToolResult
 pub fn search(root: PathBuf, p: SearchParams) -> anyhow::Result<CallToolResult> {
     Detector::new(root.clone())?; // config validation + chdir parity with the CLI
     let settings = search::semantic::settings_from_config(&root)?;
-    let semantic_on = settings.enabled && !p.bm25;
 
-    // Ensure the BM25 index exists (semantic re-embeds only when stale).
+    // Ensure the BM25 index exists (build is a no-op when current; a stale
+    // manifest refreshes incrementally instead of rebuilding from scratch).
     if search::index::is_stale(&root) || !commands::search::index_exists(&root) {
-        search::index::build(&root, true)?;
+        search::index::build(&root, false)?;
     }
 
-    let (mode, hits) = if semantic_on {
+    let semantic_on = settings.enabled && !p.bm25;
+    if semantic_on {
         search::semantic::build(&root, &settings, false)?;
-        let hits = search::semantic::search(&root, &p.query, &settings, p.limit)?;
-        ("semantic", hits)
-    } else {
-        let hits = search::index::search(
-            &root,
-            &p.query,
-            p.limit,
-            p.lang.as_deref(),
-            p.path.as_deref(),
-        )?;
-        ("bm25", hits)
-    };
+    }
+
+    let outcome = search::run_query(
+        search::QueryRequest {
+            root: &root,
+            query: &p.query,
+            limit: p.limit,
+            lang: p.lang.as_deref(),
+            path_filter: p.path.as_deref(),
+            force_bm25: p.bm25,
+            source: "mcp",
+        },
+        &settings,
+    )?;
+    let trace = outcome.trace;
+    let hits = outcome.hits;
 
     let results: Vec<_> = hits
         .iter()
@@ -203,8 +208,9 @@ pub fn search(root: PathBuf, p: SearchParams) -> anyhow::Result<CallToolResult> 
         })
         .collect();
     Ok(CallToolResult::structured(json!({
-        "mode": mode,
+        "mode": trace.mode,
         "results": results,
+        "trace": trace,
     })))
 }
 

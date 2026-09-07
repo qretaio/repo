@@ -172,7 +172,7 @@ pub fn children(root: &Path, parent: &str) -> Result<Vec<Definition>> {
 /// via the tree-sitter parse.
 pub fn references(root: &Path, symbol: &str) -> Vec<Reference> {
     let mut out = Vec::new();
-    for rel in crate::search::index::list_source_files(root) {
+    for rel in crate::search::discovery::list_source_files(root) {
         if lang::language_for_path(Path::new(&rel)).is_none() {
             continue;
         }

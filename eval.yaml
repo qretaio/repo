@@ -1,0 +1,57 @@
+# Golden-query eval for this repository (`repo eval`).
+# Concepts phrased the way a person/agent would ask, not keyword copies of
+# the code, so BM25 and the hybrid pipeline are meaningfully compared.
+k: 10
+modes: [bm25, hybrid]
+queries:
+  - q: inverted emptiness check broke every symbol lookup
+    relevant:
+      - path: src/commands/refs.rs
+        grade: 3
+
+  - q: reciprocal rank fusion of lexical and dense rankings
+    relevant:
+      - path: src/search/semantic.rs
+        grade: 3
+
+  - q: directory walker that respects gitignore rules
+    relevant:
+      - path: src/search/discovery.rs
+        grade: 3
+
+  - q: aligning chunks to symbol boundaries with breadcrumbs
+    relevant:
+      - path: src/search/chunker.rs
+        grade: 3
+
+  - q: incremental index update by deleting changed file terms
+    relevant:
+      - path: src/search/index.rs
+        grade: 2
+
+  - q: MCP protocol handshake over stdio transport
+    relevant:
+      - path: tests/mcp_stdio.rs
+        grade: 2
+      - path: src/mcp/mod.rs
+        grade: 1
+
+  - q: CEL expressions decide which quality checks apply
+    relevant:
+      - path: src/detect.rs
+        grade: 2
+
+  - q: gradle task list cached by build file modification times
+    relevant:
+      - path: src/tasks.rs
+        grade: 2
+
+  - q: retry embedding with halved text when over model context
+    relevant:
+      - path: src/search/semantic.rs
+        grade: 2
+
+  - q: symbol store tracks file mtimes in sqlite
+    relevant:
+      - path: src/symbols/db.rs
+        grade: 2
