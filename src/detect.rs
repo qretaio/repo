@@ -774,7 +774,11 @@ mod tests {
             .unwrap()
             .execute(&ctx)
             .unwrap();
-        assert!(matches!(val, Value::String(ref s) if s.contains("src/repo")));
+        let expected = root.canonicalize().unwrap_or(root);
+        assert!(
+            matches!(val, Value::String(ref s) if Path::new(s.as_str()) == expected),
+            "repo_root should be the detected root {expected:?}, got {val:?}"
+        );
     }
 
     #[test]
