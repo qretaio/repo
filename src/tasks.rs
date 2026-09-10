@@ -3,6 +3,9 @@
 //! Enumerates tasks defined by common runners so `repo run` can fall back to
 //! them and `repo lint`/`repo fmt` can *prefer* them over our built-in guesses:
 //!
+//! - **mise** — `mise.toml`/`⁠.mise.toml` (+ `.local` variants, grouped
+//!   `mise/config.toml` et al.) `[tasks.<name>]` tables and executable file
+//!   tasks in `mise-tasks/` etc. (argv: `mise run <name>`)
 //! - **npm/pnpm/yarn/bun** — `package.json` `scripts` (argv: `{pm} run <name>`)
 //! - **deno** — `deno.json`/`deno.jsonc` `tasks` (argv: `deno task <name>`)
 //! - **just** — `justfile`/`Justfile` recipes (argv: `just <name>`)
@@ -12,8 +15,10 @@
 //!   task, since it spins a JVM (1-5s).
 //!
 //! Priority when several runners define the same task name:
-//! `just → make → deno → npm → gradle`. Purpose-built orchestrators win over
-//! language package managers; gradle is the expensive last resort.
+//! `mise → just → make → deno → npm → gradle`. mise leads because its tasks
+//! run with the project's declared tools + env on PATH — the environment the
+//! other runners' commands silently assume. Gradle is the expensive last
+//! resort.
 
 use std::collections::HashSet;
 use std::fs;
@@ -32,6 +37,7 @@ use crate::search::index::fnv1a64;
 pub enum Runner {
     Npm(String),
     Deno,
+    Mise,
     Just,
     Make,
     Gradle,
@@ -43,6 +49,7 @@ impl Runner {
         match self {
             Runner::Npm(_) => "npm",
             Runner::Deno => "deno",
+            Runner::Mise => "mise",
             Runner::Just => "just",
             Runner::Make => "make",
             Runner::Gradle => "gradle",
@@ -70,6 +77,7 @@ impl Found {
 pub struct TaskRunners {
     npm: Option<(String, IndexMap<String, String>)>,
     deno: Option<IndexMap<String, String>>,
+    mise: Option<HashSet<String>>,
     just: Option<HashSet<String>>,
     make: Option<HashSet<String>>,
     gradle_marker: Option<PathBuf>,
@@ -83,6 +91,7 @@ impl TaskRunners {
         Self {
             npm: npm_scripts(pkg, pm),
             deno: deno_tasks(),
+            mise: mise_tasks(),
             just: just_recipes(),
             make: make_targets(),
             gradle_marker: gradle_marker(),
@@ -93,6 +102,14 @@ impl TaskRunners {
     /// First runner (by priority) defining `name`, else `None`. Gradle is
     /// queried lazily — only if the cheaper runners all lack `name`.
     pub fn find(&self, name: &str) -> Option<Found> {
+        if let Some(t) = &self.mise {
+            if t.contains(name) {
+                return Some(Found {
+                    runner: Runner::Mise,
+                    argv: vec!["mise".into(), "run".into(), name.into()],
+                });
+            }
+        }
         if let Some(t) = &self.just {
             if t.contains(name) {
                 return Some(Found {
@@ -150,6 +167,12 @@ impl TaskRunners {
     /// Every runner that defines `name`, in priority order. For `--list` display.
     pub fn list(&self, name: &str) -> Vec<Found> {
         let mut out = Vec::new();
+        if self.mise.as_ref().is_some_and(|t| t.contains(name)) {
+            out.push(Found {
+                runner: Runner::Mise,
+                argv: vec!["mise".into(), "run".into(), name.into()],
+            });
+        }
         if self.just.as_ref().is_some_and(|t| t.contains(name)) {
             out.push(Found {
                 runner: Runner::Just,
@@ -252,6 +275,210 @@ fn strip_jsonc(src: &str) -> String {
     let line_re = Regex::new(r"//[^\n]*").unwrap();
     let no_blocks = block_re.replace_all(src, "");
     line_re.replace_all(&no_blocks, "").into_owned()
+}
+
+/// mise tasks from config `[tasks.<name>]` tables plus executable file tasks.
+/// Prefer `mise tasks --local --name-only` (authoritative: handles quoting,
+/// `test:group` naming, hidden filtering, parent-dir merging) when the binary
+/// is on PATH; otherwise parse the config + task files directly.
+fn mise_tasks() -> Option<HashSet<String>> {
+    mise_tasks_in(Path::new("."))
+}
+
+fn mise_tasks_in(dir: &Path) -> Option<HashSet<String>> {
+    if which::which("mise").is_ok() {
+        if let Ok(out) = duct::cmd("mise", ["tasks", "--local", "--name-only"])
+            .dir(dir)
+            .stdout_capture()
+            .stderr_capture()
+            .unchecked()
+            .run()
+        {
+            if out.status.success() {
+                let set: HashSet<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(String::from)
+                    .collect();
+                if !set.is_empty() {
+                    return Some(set);
+                }
+            }
+        }
+    }
+    parse_mise_configs(dir)
+}
+
+/// Config files searched for `[tasks.<name>]` tables. Env-suffixed variants
+/// (`mise.<env>.toml`) only load under `MISE_ENV`, so they are not listed —
+/// the authoritative `mise tasks` path covers them when the binary exists.
+const MISE_CONFIG_FILES: &[&str] = &[
+    "mise.local.toml",
+    ".mise.local.toml",
+    "mise.toml",
+    ".mise.toml",
+    "mise/config.toml",
+    ".mise/config.toml",
+    ".config/mise.toml",
+    ".config/mise/config.toml",
+];
+
+/// Directories holding executable file tasks (`hello.sh` → `hello`,
+/// `test/units` → `test:units`, `test/_default` → `test`).
+const MISE_TASK_DIRS: &[&str] = &[
+    "mise-tasks",
+    ".mise-tasks",
+    "mise/tasks",
+    ".mise/tasks",
+    ".config/mise/tasks",
+];
+
+fn parse_mise_configs(dir: &Path) -> Option<HashSet<String>> {
+    let mut set: HashSet<String> = HashSet::new();
+    for name in MISE_CONFIG_FILES {
+        if let Ok(raw) = fs::read_to_string(dir.join(name)) {
+            set.extend(parse_mise_toml(&raw));
+        }
+    }
+    // `conf.d` fragments (non-hidden `*.toml`, alphabetical — order is
+    // irrelevant here since task names merge).
+    for frag_dir in ["mise/conf.d", ".mise/conf.d", ".config/mise/conf.d"] {
+        if let Ok(rd) = fs::read_dir(dir.join(frag_dir)) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let is_frag = p.extension().is_some_and(|e| e == "toml")
+                    && p.file_name()
+                        .is_some_and(|n| !n.to_string_lossy().starts_with('.'));
+                if is_frag {
+                    if let Ok(raw) = fs::read_to_string(&p) {
+                        set.extend(parse_mise_toml(&raw));
+                    }
+                }
+            }
+        }
+    }
+    for task_dir in MISE_TASK_DIRS {
+        set.extend(mise_file_tasks_in(&dir.join(task_dir)));
+    }
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Extract `[tasks.<name>]` table names from TOML source. A dotted suffix is a
+/// sub-table of the task (`[tasks.build.env]` → `build`); quoted names keep
+/// their dots and spaces (`[tasks."my task"]`). Commented lines can't match
+/// (the regex anchors on `[`), and bare `[tasks]` yields no name.
+fn parse_mise_toml(raw: &str) -> HashSet<String> {
+    let re = Regex::new(r"(?m)^\s*\[tasks\.([^\]]*)\]").unwrap();
+    let mut set = HashSet::new();
+    for caps in re.captures_iter(raw) {
+        if let Some(name) = mise_task_header_name(caps.get(1).unwrap().as_str()) {
+            set.insert(name);
+        }
+    }
+    set
+}
+
+/// First dotted component of a `[tasks.…]` header, honoring TOML quoting.
+fn mise_task_header_name(rest: &str) -> Option<String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let first = if rest.starts_with('"') || rest.starts_with('\'') {
+        let q = rest.as_bytes()[0] as char;
+        rest[1..].split(q).next()?.to_string()
+    } else {
+        rest.split(['.', ' ', '\t']).next()?.trim().to_string()
+    };
+    if first.is_empty() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+/// Executable scripts under a file-task dir, walked recursively (explicit
+/// stack — no `walkdir` dep). `*.toml` files are skipped: they are not a
+/// documented file-task format (mise parses their bare keys as task names —
+/// a quirk the authoritative binary path reproduces exactly when present).
+fn mise_file_tasks_in(dir: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return set;
+    };
+    let mut stack: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            if p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            {
+                continue; // hidden dirs hold no tasks
+            }
+            if let Ok(rd) = fs::read_dir(&p) {
+                stack.extend(rd.flatten().map(|e| e.path()));
+            }
+            continue;
+        }
+        if p.extension().is_some_and(|e| e == "toml") {
+            continue;
+        }
+        if p.file_name()
+            .is_none_or(|n| n.to_string_lossy().starts_with('.'))
+            || !is_executable(&p)
+        {
+            continue;
+        }
+        let Ok(rel) = p.strip_prefix(dir) else {
+            continue;
+        };
+        if let Some(name) = mise_file_task_name(rel) {
+            set.insert(name);
+        }
+    }
+    set
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // mise requires the exec bit on macOS/Linux; without it the file is invisible.
+    fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// `hello.sh` → `hello` (mise strips one trailing extension, whatever it is),
+/// `test/units` → `test:units`, `test/_default` → `test`.
+fn mise_file_task_name(rel: &Path) -> Option<String> {
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let file = parts.pop()?;
+    let stem = match file.rfind('.') {
+        Some(i) if i > 0 => file[..i].to_string(),
+        _ => file,
+    };
+    if stem == "_default" {
+        if parts.is_empty() {
+            return Some("_default".to_string());
+        }
+    } else {
+        parts.push(stem);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(":"))
+    }
 }
 
 /// justfile recipes. Prefer `just --summary` (authoritative) when the binary is
@@ -497,12 +724,14 @@ impl TaskRunners {
     fn from_parts(
         npm: Option<(String, IndexMap<String, String>)>,
         deno: Option<IndexMap<String, String>>,
+        mise: Option<HashSet<String>>,
         just: Option<HashSet<String>>,
         make: Option<HashSet<String>>,
     ) -> Self {
         Self {
             npm,
             deno,
+            mise,
             just,
             make,
             gradle_marker: None,
@@ -530,6 +759,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let f = t.find("dev").unwrap();
         assert_eq!(f.runner, Runner::Npm("npm".into()));
@@ -538,8 +768,19 @@ mod tests {
 
     #[test]
     fn npm_missing_name_is_none() {
-        let t = TaskRunners::from_parts(Some(npm_map(&[("dev", "x")])), None, None, None);
+        let t = TaskRunners::from_parts(Some(npm_map(&[("dev", "x")])), None, None, None, None);
         assert!(t.find("nope").is_none());
+    }
+
+    #[test]
+    fn mise_argv() {
+        let mut mise = HashSet::new();
+        mise.insert("lint".to_string());
+        let t = TaskRunners::from_parts(None, None, Some(mise), None, None);
+        let f = t.find("lint").unwrap();
+        assert_eq!(f.runner, Runner::Mise);
+        assert_eq!(f.argv, vec!["mise", "run", "lint"]);
+        assert_eq!(f.display(), "mise run lint");
     }
 
     #[test]
@@ -628,21 +869,29 @@ check";
     fn priority_just_beats_npm() {
         let mut just = HashSet::new();
         just.insert("dev".to_string());
-        let t = TaskRunners::from_parts(Some(npm_map(&[("dev", "x")])), None, Some(just), None);
+        let t =
+            TaskRunners::from_parts(Some(npm_map(&[("dev", "x")])), None, None, Some(just), None);
         let f = t.find("dev").unwrap();
         assert_eq!(f.runner, Runner::Just, "just must outrank npm");
         assert_eq!(f.argv, vec!["just", "dev"]);
     }
 
     #[test]
+    fn priority_mise_beats_just() {
+        let mut mise = HashSet::new();
+        mise.insert("dev".to_string());
+        let mut just = HashSet::new();
+        just.insert("dev".to_string());
+        let t = TaskRunners::from_parts(None, None, Some(mise), Some(just), None);
+        let f = t.find("dev").unwrap();
+        assert_eq!(f.runner, Runner::Mise, "mise must outrank just");
+        assert_eq!(f.argv, vec!["mise", "run", "dev"]);
+    }
+
+    #[test]
     fn priority_order_full() {
-        // All runners define "x"; verify exact order just → make → deno → npm.
-        let mk_just = || {
-            let mut s = HashSet::new();
-            s.insert("x".to_string());
-            Some(s)
-        };
-        let mk_make = || {
+        // All runners define "x"; verify exact order mise → just → make → deno → npm.
+        let mk_set = || {
             let mut s = HashSet::new();
             s.insert("x".to_string());
             Some(s)
@@ -654,22 +903,25 @@ check";
         };
         let mk_npm = || Some(npm_map(&[("x", "y")]));
 
-        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), mk_just(), mk_make());
+        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), mk_set(), mk_set(), mk_set());
+        assert_eq!(t.find("x").unwrap().runner, Runner::Mise);
+
+        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), None, mk_set(), mk_set());
         assert_eq!(t.find("x").unwrap().runner, Runner::Just);
 
-        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), None, mk_make());
+        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), None, None, mk_set());
         assert_eq!(t.find("x").unwrap().runner, Runner::Make);
 
-        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), None, None);
+        let t = TaskRunners::from_parts(mk_npm(), mk_deno(), None, None, None);
         assert_eq!(t.find("x").unwrap().runner, Runner::Deno);
 
-        let t = TaskRunners::from_parts(mk_npm(), None, None, None);
+        let t = TaskRunners::from_parts(mk_npm(), None, None, None, None);
         assert_eq!(t.find("x").unwrap().runner, Runner::Npm("npm".into()));
     }
 
     #[test]
     fn find_any_returns_first_hit() {
-        let t = TaskRunners::from_parts(Some(npm_map(&[("start", "x")])), None, None, None);
+        let t = TaskRunners::from_parts(Some(npm_map(&[("start", "x")])), None, None, None, None);
         let f = t.find_any(&["run", "start", "dev"]).unwrap();
         assert_eq!(f.argv, vec!["npm", "run", "start"]);
         assert!(t.find_any(&["run", "dev"]).is_none());
@@ -677,14 +929,107 @@ check";
 
     #[test]
     fn list_all_runners_for_name() {
+        let mut mise = HashSet::new();
+        mise.insert("build".into());
         let mut just = HashSet::new();
         just.insert("build".into());
-        let t = TaskRunners::from_parts(Some(npm_map(&[("build", "x")])), None, Some(just), None);
+        let t = TaskRunners::from_parts(
+            Some(npm_map(&[("build", "x")])),
+            None,
+            Some(mise),
+            Some(just),
+            None,
+        );
         let found = t.list("build");
-        // Both just and npm define "build"; both reported, priority order.
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].runner, Runner::Just);
-        assert_eq!(found[1].runner, Runner::Npm("npm".into()));
+        // mise, just and npm define "build"; all reported, priority order.
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].runner, Runner::Mise);
+        assert_eq!(found[1].runner, Runner::Just);
+        assert_eq!(found[2].runner, Runner::Npm("npm".into()));
+    }
+
+    #[test]
+    fn parse_mise_toml_extracts_tasks() {
+        let raw = "[tasks.build]\nrun = \"cargo build\"\n\n[tasks.lint]\nrun = \"x\"\n";
+        let set = parse_mise_toml(raw);
+        assert!(set.contains("build"));
+        assert!(set.contains("lint"));
+    }
+
+    #[test]
+    fn parse_mise_toml_sub_tables_and_quotes() {
+        let raw = "[tasks.build.env]\nFOO = \"1\"\n\
+                   [tasks.\"my task\"]\nrun = \"x\"\n\
+                   [tasks.'quoted-dash']\nrun = \"x\"\n\
+                   [tasks]\nbuild = \"inline\"\n\
+                   # [tasks.commented]\n";
+        let set = parse_mise_toml(raw);
+        // `[tasks.build.env]` still means task `build`, not `build.env`.
+        assert!(set.contains("build"));
+        assert!(!set.iter().any(|t| t.contains('.')), "no dotted names");
+        assert!(set.contains("my task"), "quoted names keep spaces");
+        assert!(set.contains("quoted-dash"));
+        assert!(!set.contains("commented"), "commented headers ignored");
+        assert!(!set.contains("tasks"), "bare `[tasks]` is not a task");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mise_file_tasks_grouping_and_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile_dir().join("mise-file-tasks");
+        let _ = fs::remove_dir_all(&tmp);
+        let task_dir = tmp.join("mise-tasks");
+        fs::create_dir_all(task_dir.join("test")).unwrap();
+        fs::create_dir_all(task_dir.join("deploy")).unwrap();
+        let exe = |p: &Path| {
+            fs::write(p, "#!/usr/bin/env bash\necho hi\n").unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        exe(&task_dir.join("hello.sh"));
+        exe(&task_dir.join("test").join("units"));
+        exe(&task_dir.join("test").join("_default"));
+        exe(&task_dir.join("deploy").join("ok.sh"));
+        // No exec bit → invisible, like mise itself.
+        fs::write(task_dir.join("deploy").join("noexec"), "echo hi\n").unwrap();
+        // Hidden files hold no tasks.
+        exe(&task_dir.join(".hidden"));
+        // `*.toml` is not a file-task format.
+        fs::write(task_dir.join("weird.toml"), "run = \"x\"\n").unwrap();
+
+        let set = mise_file_tasks_in(&task_dir);
+        assert!(set.contains("hello"), "extension stripped: {set:?}");
+        assert!(set.contains("test"), "`_default` names the group: {set:?}");
+        assert!(
+            set.contains("test:units"),
+            "subdir groups with `:`: {set:?}"
+        );
+        assert!(set.contains("deploy:ok"), "{set:?}");
+        assert!(!set.iter().any(|t| t.contains("noexec")), "needs exec bit");
+        assert!(
+            !set.iter().any(|t| t.contains("hidden")),
+            "dotfiles skipped"
+        );
+        assert!(!set.iter().any(|t| t.contains("weird")), "*.toml skipped");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_mise_configs_merges_toml_and_dirs() {
+        let tmp = tempfile_dir().join("mise-configs");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("mise.toml"),
+            "[tasks.build]\nrun = \"cargo build\"\n",
+        )
+        .unwrap();
+        fs::write(tmp.join(".mise.local.toml"), "[tasks.local]\nrun = \"x\"\n").unwrap();
+        // A project without the mise binary falls back to file parsing.
+        let set = parse_mise_configs(&tmp).unwrap();
+        assert!(set.contains("build"));
+        assert!(set.contains("local"));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     fn tempfile_dir() -> PathBuf {

@@ -3,8 +3,8 @@
 //! Runs the built-in entry commands (cargo run, go run ., npm start, …). When
 //! no built-in command applies for a detected project (or nothing is detected),
 //! falls back to tasks defined by the available runners — trying names
-//! `run → start → dev → serve` in priority order `just → make → deno → npm →
-//! gradle`. Output always streams live.
+//! `run → start → dev → serve` in priority order `mise → just → make → deno →
+//! npm → gradle`. Output always streams live.
 
 use clap::Args;
 use colored::Colorize;
@@ -49,7 +49,7 @@ pub fn run(d: &Detector, _g: &Globals, args: &RunArgs) -> i32 {
         }
         println!(
             "{}",
-            "No run task found. Define one via npm scripts, justfile, make, deno, or gradle."
+            "No run task found. Define one via mise tasks, npm scripts, justfile, make, deno, or gradle."
                 .yellow()
         );
         return 0;

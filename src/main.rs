@@ -101,8 +101,8 @@ enum Cmd {
     /// Run the project's program/binary, falling back to task runners.
     ///
     /// Runs built-in entry commands (cargo run, go run ., npm start, …); if
-    /// none apply, falls back to tasks defined by npm scripts, justfile, make,
-    /// deno, or gradle — trying names `run → start → dev → serve`.
+    /// none apply, falls back to tasks defined by mise, npm scripts, justfile,
+    /// make, deno, or gradle — trying names `run → start → dev → serve`.
     /// Output always streams live.
     Run(RunArgs),
 

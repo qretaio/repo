@@ -1,7 +1,8 @@
 //! Lint command.
 //!
-//! Preference: if the project defines a `lint` task in any runner (npm script,
-//! justfile recipe, …), run THAT and drop our redundant project-specific
+//! Preference: if the project defines a `lint` task in any runner (mise task,
+//! npm script, justfile recipe, …), run THAT and drop our redundant
+//! project-specific
 //! linters (ESLint/Clippy/Ruff) — they're what the project's script covers.
 //! Security checks (`security: true`: audit/govulncheck/pip-audit) and the
 //! universal security linters (Semgrep/Gitleaks/Trivy) always run regardless.
@@ -80,7 +81,7 @@ pub fn core(d: &Detector, g: &Globals, args: &LintArgs, opts: &RunOptions) -> Co
     }
 
     let mode = Mode::Fix(args.fix);
-    // A project-defined `lint` task (npm/just/make/deno/gradle). When present,
+    // A project-defined `lint` task (mise/npm/just/make/deno/gradle). When present,
     // it replaces the redundant project-specific linters but NOT security.
     let repo_lint = d.runner_cmd("lint");
     let mut results = Vec::new();

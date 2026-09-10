@@ -11,8 +11,8 @@
 #   script(name)          — package.json defines a script named `name`
 #   bin(name)             — binary is on PATH
 #   project(id)           — project type `id` was detected (for when only)
-#   task(name)            — any task runner (npm/deno/just/make, and lazily
-#                          gradle) defines a task named `name`
+#   task(name)            — any task runner (mise/npm/deno/just/make, and
+#                          lazily gradle) defines a task named `name`
 #
 # cost: 0 (default) = always runs. Higher values need --cost N to run.
 # security: true marks a vulnerability check (audit, govulncheck, …) that

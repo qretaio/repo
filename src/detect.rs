@@ -153,9 +153,10 @@ impl Detector {
             det.contains(id.as_str())
         });
 
-        // Expose `task(name)` — true if any task runner (npm/deno/just/make, and
-        // lazily gradle) defines a task named `name`. Used by `run`/`lint`/`fmt`
-        // fallback + preference logic and available to YAML `when` expressions.
+        // Expose `task(name)` — true if any task runner (mise/npm/deno/just/
+        // make, and lazily gradle) defines a task named `name`. Used by
+        // `run`/`lint`/`fmt` fallback + preference logic and available to YAML
+        // `when` expressions.
         let tr = Arc::clone(&task_runners);
         cel.add_function("task", move |name: Arc<String>| -> bool {
             tr.has(name.as_str())
@@ -213,13 +214,13 @@ impl Detector {
         &self.universal
     }
 
-    /// The discovered task runners (npm/deno/just/make/gradle).
+    /// The discovered task runners (mise/npm/deno/just/make/gradle).
     pub fn task_runners(&self) -> &crate::tasks::TaskRunners {
         &self.task_runners
     }
 
     /// Synthesize a `CommandDef` for the first runner defining `name`
-    /// (priority `just → make → deno → npm → gradle`), else `None`.
+    /// (priority `mise → just → make → deno → npm → gradle`), else `None`.
     pub fn runner_cmd(&self, name: &str) -> Option<CommandDef> {
         let found = self.task_runners.find(name)?;
         Some(CommandDef {

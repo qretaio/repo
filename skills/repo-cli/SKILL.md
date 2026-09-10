@@ -9,8 +9,8 @@ repo — a command only runs when its own config is present.
 **Command groups:**
 
 - **quality** — `lint` `fmt` `build` `test` `run`: per-project, auto-detected.
-  Project-defined tasks (npm scripts, justfile, …) take preference; security
-  checks and audits with `--cost 10`.
+  Project-defined tasks (mise, npm scripts, justfile, …) take preference;
+  security checks and audits with `--cost 10`.
 - **understand** — `context` (`ctx`): AI-ready snapshot (git, metadata, deps,
   TODOs, structure). `--full` adds stats/analysis/audit + a tree-sitter symbol map.
 - **search** — `index` then `search <q>`: hybrid BM25 + semantic (local
